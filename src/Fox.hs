@@ -1,16 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveGeneric #-}
 
--- |
--- Module      : Fox
--- Description : Fox calculus over the free group: sparse Z[F], derivatives, parsing, evaluation, and soft heuristics
--- Copyright   : (c) 2025
--- License     : BSD-3-Clause
--- Maintainer  : you@example.com
--- Stability   : experimental
--- Portability : portable
---
--- Text overview:
 --
 -- * Core types:
 --     - 'Atom'  — a generator with (possibly negative) integer exponent.
@@ -31,8 +21,8 @@
 --
 module Fox
   ( WordF, Atom(..)
-  , wOne, wMul, wInv, wPow, normalize, letter
-  , ZF, foxD, jacobianZ
+  , wOne, wMul, wInv, wPow, normalize, letter, parseWord
+  , ZF, foxD, jacobianZ, explodeUnits
   , GroupLike(..)
   , evalWord, pushForward
   , l1Norm, pAdicMaxNorm, softMembershipScore
@@ -178,12 +168,27 @@ zfScale :: Integer -> ZF -> ZF
 zfScale s = M.filter (/=0) . M.map (s *)
 
 -- | Left-multiply a Z[F] element by a word.
-leftMul :: WordF -> ZF -> ZF
-leftMul w = M.fromListWith (+) . map (\(g,c) -> (w `wMul` g, c)) . M.toList
+-- leftMul :: WordF -> ZF -> ZF
+-- leftMul w = M.fromListWith (+) . map (\(g,c) -> (w `wMul` g, c)) . M.toList
 
--- | Right-multiply a Z[F] element by a word.
+-- -- | Right-multiply a Z[F] element by a word.
+-- rightMul :: ZF -> WordF -> ZF
+-- rightMul z w = M.fromListWith (+) [ (g `wMul` w, c) | (g,c) <- M.toList z ]
+
+leftMul :: WordF -> ZF -> ZF
+leftMul w =
+  M.filter (/=0) . M.fromListWith (+)  -- оба варианта ок:
+    . map (\(g,c) -> (w `wMul` g, c))  -- 1) чистая композиция
+    . M.toList                          --    без промежуточного списка
+-- или короче: leftMul w = M.filter (/=0) . M.fromListWith (+) . map (\(g,c)->(w `wMul` g,c)) . M.toList
+
 rightMul :: ZF -> WordF -> ZF
-rightMul z w = M.fromListWith (+) [ (g `wMul` w, c) | (g,c) <- M.toList z ]
+rightMul z w =
+  M.filter (/=0) $ M.fromListWith (+)
+    [ (g `wMul` w, c) | (g,c) <- M.toList z ]
+-- альтернативно в композиционном стиле:
+-- rightMul z w = (M.filter (/=0) . M.fromListWith (+)) [ (g `wMul` w, c) | (g,c) <- M.toList z ]
+
 
 --------------------------------------------------------------------------------
 -- Fox derivatives
@@ -193,19 +198,38 @@ rightMul z w = M.fromListWith (+) [ (g `wMul` w, c) | (g,c) <- M.toList z ]
 -- We implement the standard scan:
 --   For w = a1 ... an (ai are unit letters), ∂_x(w) = Σ prefix_{i-1} ∂_x(ai),
 --   with ∂_x(x) = 1, ∂_x(y≠x) = 0, ∂_x(x^{-1}) = -x^{-1}.
+-- foxD :: Text -> WordF -> ZF
+-- foxD x w =
+--   let units = explodeUnits w
+--       go _prefix [] = zfZero
+--       go prefix (Atom n 1 : as)
+--         | n == x    = zfAdd (zfSingleton prefix 1) (go (prefix `wMul` WordF [Atom n 1]) as)
+--         | otherwise = go (prefix `wMul` WordF [Atom n 1]) as
+--       go prefix (Atom n (-1) : as)
+--         | n == x    = let term = prefix `wMul` WordF [Atom n (-1)]
+--                        in zfAdd (zfSingleton term (-1)) (go (prefix `wMul` WordF [Atom n (-1)]) as)
+--         | otherwise = go (prefix `wMul` WordF [Atom n (-1)]) as
+--       go _ (_:_)    = error "foxD: unit expansion should only contain ±1 exponents"
+--   in go wOne units
 foxD :: Text -> WordF -> ZF
-foxD x w =
-  let units = explodeUnits w
-      go _prefix [] = zfZero
-      go prefix (Atom n 1 : as)
-        | n == x    = zfAdd (zfSingleton prefix 1) (go (prefix `wMul` WordF [Atom n 1]) as)
-        | otherwise = go (prefix `wMul` WordF [Atom n 1]) as
-      go prefix (Atom n (-1) : as)
-        | n == x    = let term = prefix `wMul` WordF [Atom n (-1)]
-                       in zfAdd (zfSingleton term (-1)) (go (prefix `wMul` WordF [Atom n (-1)]) as)
-        | otherwise = go (prefix `wMul` WordF [Atom n (-1)]) as
-      go _ (_:_)    = error "foxD: unit expansion should only contain ±1 exponents"
-  in go wOne units
+foxD x (WordF xs) = go wOne xs
+  where
+    go _    [] = zfZero
+    go pref (Atom n e : rest)
+      | n == x  =
+          let series
+                | e > 0     = [ zfSingleton (pref `wMul` wPow (WordF [Atom n 1]) i) 1
+                               | i <- [0 .. e-1] ]
+                | e < 0     = [ zfSingleton (pref `wMul` wPow (WordF [Atom n 1]) (-i)) (-1)
+                               | i <- [1 .. (-e)] ]
+                | otherwise = []
+              term = foldl' zfAdd zfZero series
+              pref' = pref `wMul` WordF [Atom n e]
+          in zfAdd term (go pref' rest)
+      | otherwise =
+          let pref' = pref `wMul` WordF [Atom n e]
+          in go pref' rest
+
 
 -- | All Fox partials for given alphabet order.
 foxAll :: [Text] -> WordF -> [(Text, ZF)]
@@ -222,14 +246,29 @@ class (Eq a, Ord a, Show a) => GroupLike a where
   gInv :: a -> a
 
 -- | Evaluate a word under a homomorphism φ: name -> target.
-evalWord :: GroupLike a => (Text -> a) -> WordF -> a
-evalWord phi (WordF xs) = foldl' step gOne xs
+-- evalWord :: GroupLike a => (Text -> a) -> WordF -> a
+-- evalWord phi (WordF xs) = foldl' step gOne xs
+--   where
+--     step acc (Atom n e) =
+--       let base = phi n
+--           single = if e >= 0 then base else gInv base
+--           times  = abs e
+--       in iterate (gMul single) acc !! times
+-- быстрое возведение в степень в любой GroupLike
+gPow :: GroupLike a => a -> Int -> a
+gPow _ 0 = gOne
+gPow a n
+  | n < 0     = gPow (gInv a) (-n)
+  | otherwise = go a n gOne
   where
-    step acc (Atom n e) =
-      let base = phi n
-          single = if e >= 0 then base else gInv base
-          times  = abs e
-      in iterate (gMul single) acc !! times
+    go _ 0 acc = acc
+    go x k acc
+      | odd k     = go (gMul x x) (k `quot` 2) (gMul acc x)
+      | otherwise = go (gMul x x) (k `quot` 2) acc
+
+evalWord :: GroupLike a => (Text -> a) -> WordF -> a
+evalWord phi (WordF xs) =
+  foldl' (\acc (Atom n e) -> gMul acc (gPow (phi n) e)) gOne xs
 
 -- | Push-forward a Z[F] element to Z[G] by mapping each basis word using φ
 -- and summing equal images. This is useful to compute norms on the quotient.

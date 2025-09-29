@@ -1,10 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- |
--- | WuModel.Core (pure, extended)
--- |
--- | Содержимое:
+-- | 
 -- |   • Презентации (шаблоны: букет, тор, поверхность, сфера, Moore, mapping torus).
 -- |   • Moore-комплекс в размерности 2 (N2, d2).
 -- |   • Целочисленный Fox-Якобиан ε∘∂ и Смитова нормальная форма:

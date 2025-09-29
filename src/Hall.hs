@@ -2,10 +2,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 
 -- |
--- | Hall (Core + Nilpotent Group; BCH via degree-recursive Casas–Murua)
--- |
--- | Implemented
--- | -----------
 -- | • Hall basis/order and admissible-pair reduction to Hall normal form.
 -- | • Lie algebras over ℤ and ℚ with nilpotency class cutoff (weight > c pruned).
 -- | • BCH over ℚ via degree-by-degree Casas–Murua recurrence:
@@ -27,7 +23,8 @@
 -- |
 
 module Hall
-  ( smithNormalForm
+  ( Basic(..), GenId(..), LieZ(..), LieQ(..), negLQ, zeroLQ, singletonLQ, ppGroupNF, insertLieZRight, addLQ, scaleLQ, bracketLQ, toQ, truncateByWeightQ, bchQ, weight, GroupNF(..), identityG, groupMul, groupPow, groupComm, normalizeNF, lieZtoG
+  , smithNormalForm
   , smithDiag
   , runHallTests
   ) where
@@ -154,6 +151,22 @@ ppLieZ (LieZ m)
 --   if (u,v) admissible => [u,v] is a new basic node
 --   else, if u=[a,b] then   [[a,b],v] = [a,[b,v]] - [[a,v],b]
 -- (This sign is crucial. Many implementations mistakenly use a '+'.)
+-- brBasicZ :: Int -> Basic -> Basic -> LieZ
+-- brBasicZ c u v
+--   | weight u + weight v > c = zeroLZ
+--   | hallCompare u v == EQ   = zeroLZ
+--   | hallCompare u v == GT =
+--       if isHallPair u v
+--         then singletonLZ (Node u v) 1
+--         else case u of
+--                Leaf _     -> error "brBasicZ: Leaf>v but not admissible"
+--                Node a b   ->
+--                  -- CORRECT Hall reduction (from Jacobi):
+--                  -- [[a,b],v] = [a,[b,v]] + [[a,v],b]
+--                  addLZ (brBasicZ c a (reduceBasic c (Node b v)))
+--                        (brBasicZ c (reduceBasic c (Node a v)) b)
+--   | otherwise = negLZ (brBasicZ c v u)
+
 brBasicZ :: Int -> Basic -> Basic -> LieZ
 brBasicZ c u v
   | weight u + weight v > c = zeroLZ
@@ -162,12 +175,13 @@ brBasicZ c u v
       if isHallPair u v
         then singletonLZ (Node u v) 1
         else case u of
-               Leaf _     -> error "brBasicZ: Leaf>v but not admissible"
-               Node a b   ->
-                 -- CORRECT Hall reduction (from Jacobi):
+               Leaf _ -> error "brBasicZ: Leaf>v but not admissible"
+               Node a b ->
+                 -- Jacobi-style Hall reduction on non-admissible (u=[a,b], v):
                  -- [[a,b],v] = [a,[b,v]] + [[a,v],b]
-                 addLZ (brBasicZ c a (reduceBasic c (Node b v)))
-                       (brBasicZ c (reduceBasic c (Node a v)) b)
+                 let t1 = bracketLZ c (singletonLZ a 1) (brBasicZ c b v)
+                     t2 = bracketLZ c (brBasicZ c a v) (singletonLZ b 1)
+                 in addLZ t1 t2
   | otherwise = negLZ (brBasicZ c v u)
 
 

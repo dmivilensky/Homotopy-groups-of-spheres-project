@@ -62,7 +62,7 @@ library
     import:           warnings
 
     -- Modules exported by the library.
-    exposed-modules:  Fox Hall Lambda Padic WuModel
+    exposed-modules:  Fox Hall Lambda Padic WuModel Bridge
 
     -- Modules included in this library but not exported.
     -- other-modules:

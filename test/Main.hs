@@ -5,11 +5,13 @@ import qualified Fox as F
 import qualified Hall as H
 import qualified Padic as P
 import qualified Lambda as L
+import qualified Bridge as B
 
 main :: IO ()
 main = do
---   L.runLambdaTests
+  B.runBridgeTests
 --   F.runFoxTests
---   H.runHallTests
 --   P.runPadicTests
-  W.runWuTests
+--   H.runHallTests
+--   L.runLambdaTests
+--   W.runWuTests

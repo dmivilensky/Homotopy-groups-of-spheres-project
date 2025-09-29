@@ -1,7 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- Lambda.hs
 -- Lambda algebra over F_p (odd p)
 --  * Generators λ_i, μ_i (internal 0-based; printed 1-based)
 --  * d^1 (deg -1), graded Leibniz
@@ -13,7 +12,7 @@
 --  * Lucas binomial with per-prime cached factorials/invfactorials
 --  * 100% safe indexing (no raw (!!))
 
-module Lambda (runLambdaTests) where
+module Lambda (Prime(..), Gen(..), WordL(..), toAdmissible, d1, degW, parseWord, reducePolyFull, buildBasisBundle, runLambdaTests) where
 
 import qualified Data.Map.Strict as M
 import           Data.Map.Strict (Map)
@@ -163,9 +162,12 @@ getLucasTables p = unsafePerformIO $ do
   case M.lookup p m of
     Just v  -> pure v
     Nothing -> do
-      let facts = scanl (\a b -> (a*b) `mod` p) 1 [1..p-1]
+      let facts = scanl (\a b -> (a*b) `mod` p) 1 [1..p-1]     -- facts !! 0 == 1
           inv x = powMod x (p-2) p
-          invfacts = 0 : map (\i -> inv (facts !! i)) [1..p-1]
+          invfacts = 1 : map (inv . (facts !!)) [1..p-1]       -- invfacts !! 0 == 1
+      -- let facts = scanl (\a b -> (a*b) `mod` p) 1 [1..p-1]
+      --     inv x = powMod x (p-2) p
+      --     invfacts = 0 : map (\i -> inv (facts !! i)) [1..p-1]
       let v = (facts, invfacts)
       writeIORef lucasCacheRef (M.insert p v m)
       pure v

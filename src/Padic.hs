@@ -13,7 +13,7 @@
 -- * Tests: 'runPadicTests' (and a 'main' that calls it), using 'assert' only.
 --
 
-module Padic (runPadicTests) where
+module Padic (Weight(..), combineWeights, scoreWeight, vpQ, padicNormQ, vpZ, runPadicTests) where
 
 import           Control.Exception        (assert)
 import           Data.Ratio
@@ -80,18 +80,32 @@ ratToText q = let a = numerator q; b = denominator q
               in T.pack (show a ++ "/" ++ show b)
 
 -- | Decode a Text @"a/b"@ (or @"a"@) into a 'Rational'. Returns 'Nothing' on ill-formed input.
+-- ratFromText :: Text -> Maybe Rational
+-- ratFromText t =
+--   case T.splitOn (T.pack "/") (T.strip t) of
+--     [a]   -> (%%) <$> readI a <*> pure 1
+--     [a,b] -> (%%) <$> readI a <*> readI b
+--     _     -> Nothing
+--   where
+--     (%%) x y | y == 0    = 1 % 0
+--              | otherwise = x % y
+--     readI s = case reads (T.unpack s) of
+--                 [(n,"")] -> Just n
+--                 _        -> Nothing
 ratFromText :: Text -> Maybe Rational
 ratFromText t =
   case T.splitOn (T.pack "/") (T.strip t) of
-    [a]   -> (%%) <$> readI a <*> pure 1
-    [a,b] -> (%%) <$> readI a <*> readI b
+    [a]   -> (%) <$> readI a <*> pure 1
+    [a,b] -> do
+      n <- readI a
+      d <- readI b
+      if d == 0 then Nothing else Just (n % d)
     _     -> Nothing
   where
-    (%%) x y | y == 0    = 1 % 0
-             | otherwise = x % y
     readI s = case reads (T.unpack s) of
                 [(n,"")] -> Just n
                 _        -> Nothing
+
 
 -- | Weight carried by Bridge graph edges: real-valued cost and a p-adic valuation component.
 -- The alpha is serialised as \"a/b\".
@@ -157,7 +171,7 @@ binomIsZeroModP p n k
 -- | Small nCk modulo prime p using Lucas theorem with per-digit factorials.
 binomModP :: Integer -> Integer -> Integer -> Integer
 binomModP p n k
-  | p <= 1    = error "binomModP: p must be prime >= 2"
+  | p <= 1    = error "binomModP: p must be a prime >= 2"
   | k < 0 || k > n = 0
   | otherwise =
       let nd = reverse (lucasDigits p n)
@@ -299,9 +313,14 @@ testHenselAndInv = do
       f  x = x*x - 1
       fp x = 2*x
       a0 = 1
-      ak = henselSimple f fp p a0 k
+  -- Предпосылки Хенселя: f(a0) ≡ 0 (mod p) и p ∤ f'(a0)
+  let ok = (f a0) `mod` p == 0 && (fp a0) `mod` p /= 0
+  assertTrue "hensel preconditions" ok
+
+  let ak = henselSimple f fp p a0 k
       m  = p^k
   assertEq "henselSimple x^2-1 at p=3 to mod 3^5" ((f ak) `mod` m) 0
+
   -- inverse modulo p^k
   let a = 10
       inv = invModPrimePow p k a
