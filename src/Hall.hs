@@ -26,7 +26,11 @@
 -- | – If Y = α·X then BCH(X,Y) = X + α·X.
 -- |
 
-module Hall where
+module Hall
+  ( smithNormalForm
+  , smithDiag
+  , runHallTests
+  ) where
 
 import qualified Data.Map.Strict as M
 import           Data.Map.Strict (Map)
@@ -436,6 +440,202 @@ groupComm c g h = groupMul c (groupMul c (groupInv g) (groupInv h))
                            (groupMul c g h)
 
 --------------------------------------------------------------------------------
+-- Smith Normal Form (integer). Pure, small-size friendly.
+-- Expose: smithNormalForm, smithDiag. These are the only things WuModel needs.
+--------------------------------------------------------------------------------
+
+-- | Compute Smith normal form U * A * V = D,
+--   where U (m×m) and V (n×n) are unimodular (integer invertible),
+--   and D is diagonal with d_i | d_{i+1}.
+smithNormalForm :: [[Integer]] -> ([[Integer]], [[Integer]], [[Integer]])
+smithNormalForm a0 =
+  let m = length a0
+      n = if null a0 then 0 else length (head a0)
+      u0 = ident m
+      v0 = ident n
+  in go 0 0 u0 a0 v0
+  where
+    go i j u a v
+      | i >= nRows a || j >= nCols a = (u, a, v)
+      | otherwise =
+          case pivot i j a of
+            Nothing      -> (u, a, v)
+            Just (r, c)  ->
+              let u1 = rowSwap i r u
+                  a1 = rowSwap i r a
+                  v1 = colSwap j c v
+                  a2 = colSwap j c a1
+              in if a2!!i!!j == 0
+                    then go i (j+1) u1 a2 v1
+                    else
+                      let (u3, a3, v3) = clear i j u1 a2 v1
+                      in go (i+1) (j+1) u3 a3 v3
+
+    -- choose a (first) nonzero pivot in submatrix i.., j..
+    pivot i j a =
+      let rs = [i .. nRows a - 1]
+          cs = [j .. nCols a - 1]
+      in case [ (r,c) | r <- rs, c <- cs, a!!r!!c /= 0 ] of
+           []      -> Nothing
+           (rc:_)  -> Just rc
+
+    -- Extended gcd: returns (g,s,t) with s*a + t*b = g = gcd(a,b), g >= 0
+    egcd :: Integer -> Integer -> (Integer, Integer, Integer)
+    egcd a b = go (abs a) (abs b) 1 0 0 1
+      where
+        go r0 r1 s0 t0 s1 t1
+          | r1 == 0  = (r0, signum a * s0, signum b * t0)
+          | otherwise =
+              let q  = r0 `quot` r1
+              in go r1 (r0 - q*r1) s1 t1 (s0 - q*s1) (t0 - q*t1)
+
+    -- 2×2 unimodular row-combo acting on rows i and r:
+    --   [ s  t ] * [row_i] = new row_i  with new a_ij = g
+    --   [-b' a']   [row_r]   new row_r  with new a_rj = 0
+    -- where a' = a_ij/g, b' = a_rj/g, and s,t from egcd(a_ij, a_rj).
+    rowComb2 :: Int -> Int -> Integer -> Integer -> [[Integer]] -> [[Integer]]
+             -> ([[Integer]], [[Integer]])
+    rowComb2 i r aij arj a u =
+      let (g,s,t) = egcd aij arj
+          a' = aij `quot` g
+          b' = arj `quot` g
+          lin1 rowi rowr = zipWith (\x y -> s*x + t*y) rowi rowr
+          lin2 rowi rowr = zipWith (\x y -> (-b')*x + a'*y) rowi rowr
+          replaceRows m =
+            let ri  = m!!i; rr  = m!!r
+                ri' = lin1 ri rr
+                rr' = lin2 ri rr
+            in setRow r rr' (setRow i ri' m)
+          a'new = replaceRows a
+          u'new = replaceRows u
+      in (u'new, a'new)
+
+    -- 2×2 unimodular col-combo acting on cols j and c; symmetric to rowComb2.
+    colComb2 :: Int -> Int -> Integer -> Integer -> [[Integer]] -> [[Integer]]
+             -> ([[Integer]], [[Integer]])
+    colComb2 j c aij aic a v =
+      let (g,s,t) = egcd aij aic
+          a' = aij `quot` g
+          b' = aic `quot` g
+          lin1 colj colc = zipWith (\x y -> s*x + t*y) colj colc
+          lin2 colj colc = zipWith (\x y -> (-b')*x + a'*y) colj colc
+          -- operate on transposes to reuse row logic
+          aT = transpose' a
+          vT = transpose' v
+          (vT', aT') =
+            let cj  = aT!!j; cc  = aT!!c
+                cj' = lin1 cj cc
+                cc' = lin2 cj cc
+                repl m =
+                  let m1 = setRow c cc' (setRow j cj' m)
+                  in m1
+            in (repl vT, repl aT)
+      in (transpose' vT', transpose' aT')
+
+    -- Euclidean clear using egcd both for the column j (rows) and the row i (cols).
+    clear i j u a v =
+      let -- make pivot positive if needed (later)
+          fixSign (uM,aM) =
+            if aM!!i!!j < 0
+               then (negRow i uM, setAt2 i j (-(aM!!i!!j)) (negRow i aM))
+               else (uM,aM)
+
+          -- zero out column j except row i, while turning a_ij into gcd of that column
+          colLoop uM aM =
+            case [ r | r <- [0..nRows aM - 1], r /= i, aM!!r!!j /= 0 ] of
+              []     -> (uM, aM)
+              (r:_)  ->
+                let (u1,a1) = rowComb2 i r (aM!!i!!j) (aM!!r!!j) aM uM
+                in colLoop u1 a1
+
+          -- zero out row i except column j, while turning a_ij into gcd of that row
+          rowLoop aM vM =
+            case [ c | c <- [0..nCols aM - 1], c /= j, aM!!i!!c /= 0 ] of
+              []     -> (aM, vM)
+              (c:_)  ->
+                let (v1,a1) = colComb2 j c (aM!!i!!j) (aM!!i!!c) aM vM
+                in rowLoop a1 v1
+
+          (u1,a1)   = colLoop u a
+          (a2,v1)   = rowLoop a1 v
+          (u2,a3)   = fixSign (u1,a2)
+      in (u2, a3, v1)
+
+    reduceRow r i j u a =
+      let x = a!!r!!j
+          y = a!!i!!j
+      in if x == 0 then (u,a)
+         else let q  = x `quot` y
+                  u' = rowOp r i (-q) u
+                  a' = rowOp r i (-q) a
+              in if abs (a'!!r!!j) < abs y then (u',a') else reduceRow r i j u' a'
+
+    reduceCol c i j a v =
+      let x = a!!i!!c
+          y = a!!i!!j
+      in if x == 0 then (a,v)
+         else let q  = x `quot` y
+                  a' = colOp c j (-q) a
+                  v' = colOp c j (-q) v
+              in if abs (a'!!i!!c) < abs y then (a',v') else reduceCol c i j a' v'
+
+    -- matrix helpers (kept local)
+    nRows mtx = length mtx
+    nCols mtx = if null mtx then 0 else length (head mtx)
+
+    ident k = [ [ if r==c then 1 else 0 | c <- [0..k-1] ] | r <- [0..k-1] ]
+
+    rowSwap r1 r2 mtx = swapBy r1 r2 mtx
+    colSwap c1 c2 mtx = transpose' (swapBy c1 c2 (transpose' mtx))
+
+    rowOp r s k mtx =
+      setRow r (zipWith (\aij as -> aij + k*as) (mtx!!r) (mtx!!s)) mtx
+    colOp c s k mtx = transpose' (rowOp c s k (transpose' mtx))
+
+    negRow r mtx = setRow r (map negate (mtx!!r)) mtx
+
+    setRow r new mtx = [ if i==r then new else mtx!!i | i <- [0..nRows mtx - 1] ]
+    setAt2 i j x mtx = setRow i (setAt j x (mtx!!i)) mtx
+    setAt j x row    = [ if k==j then x else row!!k | k <- [0..length row - 1] ]
+
+    swapBy i j xs = [ xs!!perm k | k <- [0..length xs - 1] ]
+      where
+        perm k | k==i = j
+               | k==j = i
+               | otherwise = k
+
+    transpose' []         = []
+    transpose' ([]   : _) = []
+    transpose' rows       = map head rows : transpose' (map tail rows)
+
+    minimumBy3 ((r,c,v):rest) = go (r,c,v) rest
+      where
+        go acc [] = let (i,j,_) = acc in (i,j,())
+        go acc ((r',c',v'):xs)
+          | v' < (\(_,_,t)->t) acc = go (r',c',v') xs
+          | otherwise              = go acc xs
+    minimumBy3 [] = error "minimumBy3: empty"
+
+-- | Extract nonzero diagonal invariants from a (near) diagonal matrix.
+smithDiag :: [[Integer]] -> [Integer]
+smithDiag d =
+  let r = length d
+      c = if null d then 0 else length (head d)
+      k = min r c
+      diag = [ d!!i!!i | i <- [0..k-1], d!!i!!i /= 0 ]
+  in diag
+
+--------------------------------------------------------------------------------
+-- Tiny self-tests for SNF (kept local; call 'runHallTests' from your Main if needed)
+--------------------------------------------------------------------------------
+
+assertEqHall :: (Eq a, Show a) => String -> a -> a -> IO ()
+assertEqHall name got expect =
+  if got == expect
+     then putStrLn ("[ok] Hall " ++ name ++ ": " ++ show got)
+     else error ("[FAIL] Hall " ++ name ++ "\n  got:    " ++ show got ++ "\n  expect: " ++ show expect)
+
+--------------------------------------------------------------------------------
 -- Utilities & tests
 --------------------------------------------------------------------------------
 
@@ -539,14 +739,28 @@ demo = do
            putStrLn $ "  " ++ ppLieQ z
         ) [2..6]
 
---------------------------------------------------------------------------------
--- main
---------------------------------------------------------------------------------
 
-main :: IO ()
-main = do
+runHallTests :: IO ()
+runHallTests = do
   testLieIdentities
   testCollection
   testBCH
   demo
   putStrLn "Hall.Core + Hall.Nilpotent : OK."
+
+  -- A1: rank-1 matrix with gcd(entries)=1 ⇒ SNF diag [1,0]
+  let a1 = [[6,10],[15,25]]
+      (_, d1, _) = smithNormalForm a1
+  assertEqHall "SNF diag a1 == [1]" (smithDiag d1) [1]
+
+  -- A2: full-rank 2×2, det = -8, gcd(entries)=2 ⇒ SNF diag [2,4]
+  let a2 = [[2,4],[6,8]]
+      (_, d2, _) = smithNormalForm a2
+  assertEqHall "SNF diag a2 == [2,4]" (smithDiag d2) [2,4]
+
+  -- A3: zero 2×3 ⇒ empty diag
+  let a3 = replicate 2 (replicate 3 0)
+      (_, d3, _) = smithNormalForm a3
+  assertEqHall "SNF diag a3 == []" (smithDiag d3) []
+
+  putStrLn "Hall tests finished."

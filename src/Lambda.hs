@@ -13,7 +13,7 @@
 --  * Lucas binomial with per-prime cached factorials/invfactorials
 --  * 100% safe indexing (no raw (!!))
 
-module Lambda where
+module Lambda (runLambdaTests) where
 
 import qualified Data.Map.Strict as M
 import           Data.Map.Strict (Map)
@@ -628,8 +628,8 @@ printBasisTable pr cap withD1 = do
         ) (M.toList basisLists)
   putStrLn ""
 
-main :: IO ()
-main = do
+runLambdaTests :: IO ()
+runLambdaTests = do
   testLucas
   testD1
   demoAdem

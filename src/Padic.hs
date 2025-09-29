@@ -1,16 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- |
--- Module      : Padic
--- Description : p-adic utilities, number-theory helpers, and test hooks (with asserts)
--- Copyright   : (c) 2025
--- License     : BSD-3-Clause
--- Maintainer  : you@example.com
--- Stability   : experimental
--- Portability : portable
---
--- Textual overview:
 --
 -- * Core valuations: 'vpZ' (integers), 'vpQ' (rationals), 'splitPower' (n = p^k * m).
 -- * p-adic norm '|·|_p' and RL projections: 'projRe', 'projPad', 'projClip'.
@@ -23,7 +13,7 @@
 -- * Tests: 'runPadicTests' (and a 'main' that calls it), using 'assert' only.
 --
 
-module Padic where
+module Padic (runPadicTests) where
 
 import           Control.Exception        (assert)
 import           Data.Ratio
@@ -332,7 +322,3 @@ runPadicTests = do
   testHenselAndInv
   testVecAgg
   putStrLn "All Padic tests finished."
-
--- | Convenience main that just runs the tests.
-main :: IO ()
-main = runPadicTests
