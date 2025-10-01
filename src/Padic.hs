@@ -53,7 +53,7 @@ vpQ p q
 padicNormQ :: Integer -> Rational -> Double
 padicNormQ p q
   | q == 0    = 1/0
-  | otherwise = (fromIntegral p) ** fromIntegral (negate (vpQ p q))
+  | otherwise = fromIntegral p ** fromIntegral (negate (vpQ p q))
 
 -- Projections used on the RL side ------------------------------------------------
 
@@ -166,7 +166,7 @@ binomIsZeroModP p n k
           l  = max (length nd) (length kd)
           nd' = pad nd l
           kd' = pad kd l
-      in any id [ ki > ni | (ni,ki) <- zip nd' kd' ]
+      in or [ ki > ni | (ni,ki) <- zip nd' kd' ]
 
 -- | Small nCk modulo prime p using Lucas theorem with per-digit factorials.
 binomModP :: Integer -> Integer -> Integer -> Integer
@@ -250,7 +250,7 @@ henselSimple f f' p a0 k
               m'  = p^(i+1)
               fi  = f ai
               fpi = f' ai
-              num = (negate (fi `div` m)) `mod` p
+              num = negate (fi `div` m) `mod` p
               den = (fpi `mod` p)
               inv = modPow p den (fromIntegral (p-2))
               t   = (num * inv) `mod` p
@@ -314,12 +314,12 @@ testHenselAndInv = do
       fp x = 2*x
       a0 = 1
   -- Предпосылки Хенселя: f(a0) ≡ 0 (mod p) и p ∤ f'(a0)
-  let ok = (f a0) `mod` p == 0 && (fp a0) `mod` p /= 0
+  let ok = f a0 `mod` p == 0 && fp a0 `mod` p /= 0
   assertTrue "hensel preconditions" ok
 
   let ak = henselSimple f fp p a0 k
       m  = p^k
-  assertEq "henselSimple x^2-1 at p=3 to mod 3^5" ((f ak) `mod` m) 0
+  assertEq "henselSimple x^2-1 at p=3 to mod 3^5" (f ak `mod` m) 0
 
   -- inverse modulo p^k
   let a = 10

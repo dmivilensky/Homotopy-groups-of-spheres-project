@@ -1,5 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use camelCase" #-}
 
 -- Module: Bridge
 -- Λ → Hall: обучаемый «мост» и квантовка в свободную нильпотентную группу
@@ -77,7 +79,7 @@ toIntegralZWithLCM (H.LieQ mQ) =
 
 -- дискретная «экспонента» для LieZ: одна правая вставка и коллекция
 expAtomZ :: Int -> H.LieZ -> H.GroupNF
-expAtomZ c z = H.insertLieZRight c H.identityG z
+expAtomZ c = H.insertLieZRight c H.identityG
 
 -- run-length encoding: сжимаем подряд идущие одинаковые Λ-генераторы
 rleGens :: [L.Gen] -> [(L.Gen, Int)]
@@ -121,7 +123,7 @@ bchStep3 c z y =
 -- Основная свёртка: берёт RLE-блоки, умножает θ(g) на кратность и сворачивает
 bchFold :: Int -> BCHMode -> [L.Gen] -> ThetaQ -> H.LieQ
 bchFold c mode gens theta =
-  let blocks :: [(H.LieQ)]  -- каждый блок = m * θ(g)
+  let blocks :: [H.LieQ]  -- каждый блок = m * θ(g)
       blocks = [ H.scaleLQ (fromIntegral m % 1) (thetaAtomQ theta g)
                | (g,m) <- rleGens gens ]
       stepF = case mode of
@@ -155,10 +157,10 @@ applyWordTheta mode c theta (L.W gens) =
       in expAtomZ c zInt
 
 quantizeByLCM :: Int -> ThetaQ -> L.WordL -> H.GroupNF
-quantizeByLCM c theta w = applyWordTheta FoldAsProduct c theta w
+quantizeByLCM = applyWordTheta FoldAsProduct
 
 quantizeViaBCH :: Int -> ThetaQ -> L.WordL -> H.GroupNF
-quantizeViaBCH c theta w = applyWordTheta FoldViaBCH c theta w
+quantizeViaBCH = applyWordTheta FoldViaBCH
 
 --------------------------------------------------------------------------------
 -- Фичи/статистика для RL
@@ -211,18 +213,13 @@ bchUpTo3 :: Int -> H.LieQ -> H.LieQ -> H.LieQ
 bchUpTo3 c x y =
   let c3   = min 3 c
       z1   = H.addLQ x y
-      z2   = case c3 >= 2 of
-               False -> H.zeroLQ
-               True  -> H.scaleLQ (1 % 2) (H.bracketLQ c x y)
+      z2   = (if c3 >= 2 then H.scaleLQ (1 % 2) (H.bracketLQ c x y) else H.zeroLQ)
       -- вспомогательные, чтобы не считать [X,Y] 2 раза
       xy   = if c3 >= 2 then H.bracketLQ c x y else H.zeroLQ
-      z3   = case c3 >= 3 of
-               False -> H.zeroLQ
-               True  ->
-                 let x_xy = H.bracketLQ c x xy
-                     y_xy = H.bracketLQ c y xy
-                 in H.addLQ (H.scaleLQ ( 1 % 12) x_xy)
-                            (H.scaleLQ (-1 % 12) y_xy)
+      z3   = (if c3 >= 3 then (let x_xy = H.bracketLQ c x xy
+                                   y_xy = H.bracketLQ c y xy
+                               in H.addLQ (H.scaleLQ ( 1 % 12) x_xy)
+                                          (H.scaleLQ (- (1 % 12)) y_xy)) else H.zeroLQ)
   in H.truncateByWeightQ c3 (H.addLQ z1 (H.addLQ z2 z3))
 
 -- Развёртка слова Λ по θ^Q с BCH-композицией до веса ≤ targetW (2/3)

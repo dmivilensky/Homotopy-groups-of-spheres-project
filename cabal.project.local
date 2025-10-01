@@ -1,0 +1,9 @@
+packages: .
+tests: True
+benchmarks: False
+
+optimization: 2
+shared: True
+coverage: False
+library-profiling: False
+executable-profiling: False

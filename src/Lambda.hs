@@ -1,25 +1,39 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- Lambda algebra over F_p (odd p)
+-- Lambda algebra over F_p (odd p), parallel & vector-optimized
 --  * Generators λ_i, μ_i (internal 0-based; printed 1-based)
 --  * d^1 (deg -1), graded Leibniz
 --  * Odd-prime Adem relations (LL/LM/ML/MM) → Curtis admissible NF
 --  * Basis by degree (built once up to cap)
---  * Homology report using adaptive rank:
---      - column-wise Gaussian rank if rows ≤ cols
+--  * Homology report using adaptive rank (now vectorized):
+--      - column-wise Gaussian-like rank if rows ≤ cols
 --      - row-wise (via transpose idea) if cols < rows
 --  * Lucas binomial with per-prime cached factorials/invfactorials
---  * 100% safe indexing (no raw (!!))
+--  * No unsafe (!!); vector ops for linear algebra
+--  * Hot paths parallelized with Strategies (parMap rdeepseq)
 
-module Lambda (Prime(..), Gen(..), WordL(..), toAdmissible, d1, degW, parseWord, reducePolyFull, buildBasisBundle, runLambdaTests) where
+module Lambda
+  ( Prime(..), Gen(..), WordL(..)
+  , toAdmissible, d1, degW, parseWord
+  , reducePolyFull, buildBasisBundle
+  , runLambdaTests
+  ) where
 
 import qualified Data.Map.Strict as M
 import           Data.Map.Strict (Map)
 import qualified Data.Set        as S
 import           Data.Set        (Set)
-import           Data.List       (intercalate, sortBy)
+import           Data.List       (intercalate, sort)
 import           Data.Char       (isDigit, toLower)
+import           Data.Foldable   (foldl')
+import           Control.DeepSeq (NFData(..))
+import           Control.Parallel.Strategies (parMap, rdeepseq)
+import           Control.Monad   (when)
+import           Data.Maybe      (fromMaybe)
+
+import qualified Data.Vector.Unboxed as U
+import           Data.Vector.Unboxed (Vector)
 
 import           Data.IORef
 import           System.IO.Unsafe (unsafePerformIO)
@@ -45,36 +59,37 @@ mulP pr a b = modP pr (a * b)
 powMod :: Int -> Int -> Int -> Int
 powMod _ 0 m = 1 `mod` m
 powMod a e m
-  | e `mod` 2 == 0 = let t = powMod a (e `div` 2) m in (t*t) `mod` m
+  | even e = let t = powMod a (e `div` 2) m in (t*t) `mod` m
   | otherwise      = (a `mod` m) * powMod a (e-1) m `mod` m
 
 invModPrime :: Prime -> Int -> Int
 invModPrime pr@(OddP p) a = powMod (modP pr a) (p-2) p
+{-# INLINE invModPrime #-}
 
 --------------------------------------------------------------------------------
--- Safe indexing helpers (no raw (!!))
+-- Safe indexing helpers (still used in word-level code; rank uses vectors)
 --------------------------------------------------------------------------------
 
 getAt :: [a] -> Int -> Maybe a
 getAt xs i
-  | i < 0    = Nothing
+  | i < 0     = Nothing
   | otherwise = go xs i
   where
-    go [] _       = Nothing
-    go (y:_)  0   = Just y
-    go (_:ys) k   = go ys (k-1)
+    go [] _     = Nothing
+    go (y:_)  0 = Just y
+    go (_:ys) k = go ys (k-1)
 
 getAtD :: a -> [a] -> Int -> a
-getAtD def xs i = maybe def id (getAt xs i)
+getAtD def xs i = fromMaybe def (getAt xs i)
 
 setAt :: Int -> a -> [a] -> [a]
 setAt i a xs
-  | i < 0          = xs
-  | otherwise      = go xs i
+  | i < 0     = xs
+  | otherwise = go xs i
   where
-    go [] _        = []
-    go (_:ys) 0    = a : ys
-    go (y:ys) k    = y : go ys (k-1)
+    go [] _     = []
+    go (_:ys) 0 = a : ys
+    go (y:ys) k = y : go ys (k-1)
 
 --------------------------------------------------------------------------------
 -- Lambda.Core: gens/words/polys
@@ -82,15 +97,23 @@ setAt i a xs
 
 data Gen = Lam !Int | Mu !Int deriving (Eq, Ord)
 
+-- NFData instances required for rdeepseq (parMap)
+instance NFData Gen where
+  rnf (Lam i) = rnf i
+  rnf (Mu  i) = rnf i
+
 instance Show Gen where
   show (Lam i) = "lambda" ++ show (i+1)
   show (Mu  i) = "mu"     ++ show (i+1)
 
 newtype WordL = W { unW :: [Gen] } deriving (Eq, Ord)
 
+instance NFData WordL where
+  rnf (W gs) = rnf gs
+
 instance Show WordL where
   show (W [])   = "1"
-  show (W gens) = intercalate " " (map show gens)
+  show (W gens) = unwords (map show gens)
 
 (><) :: WordL -> WordL -> WordL
 W a >< W b = W (a ++ b)
@@ -107,12 +130,14 @@ type Poly = Map WordL Int
 
 normalizePoly :: Prime -> Poly -> Poly
 normalizePoly pr = M.filter (/=0) . M.map (modP pr)
+{-# INLINE normalizePoly #-}
 
 zeroPoly :: Poly
 zeroPoly = M.empty
 
 mono :: Prime -> Int -> WordL -> Poly
 mono pr c w = normalizePoly pr (M.singleton w c)
+{-# INLINE mono #-}
 
 addPoly :: Prime -> Poly -> Poly -> Poly
 addPoly pr =
@@ -133,11 +158,13 @@ mulLeftW :: Prime -> WordL -> Poly -> Poly
 mulLeftW pr w poly =
   normalizePoly pr $ M.fromListWith (addP pr)
     [ (w >< w1, c) | (w1,c) <- M.toList poly ]
+{-# INLINE mulLeftW #-}
 
 mulRightW :: Prime -> Poly -> WordL -> Poly
 mulRightW pr poly w =
   normalizePoly pr $ M.fromListWith (addP pr)
     [ (w1 >< w, c) | (w1,c) <- M.toList poly ]
+{-# INLINE mulRightW #-}
 
 --------------------------------------------------------------------------------
 -- Lucas binomial with global cache per p
@@ -162,12 +189,9 @@ getLucasTables p = unsafePerformIO $ do
   case M.lookup p m of
     Just v  -> pure v
     Nothing -> do
-      let facts = scanl (\a b -> (a*b) `mod` p) 1 [1..p-1]     -- facts !! 0 == 1
-          inv x = powMod x (p-2) p
+      let facts    = scanl (\a b -> (a*b) `mod` p) 1 [1..p-1]  -- facts !! 0 == 1
+          inv x    = powMod x (p-2) p
           invfacts = 1 : map (inv . (facts !!)) [1..p-1]       -- invfacts !! 0 == 1
-      -- let facts = scanl (\a b -> (a*b) `mod` p) 1 [1..p-1]
-      --     inv x = powMod x (p-2) p
-      --     invfacts = 0 : map (\i -> inv (facts !! i)) [1..p-1]
       let v = (facts, invfacts)
       writeIORef lucasCacheRef (M.insert p v m)
       pure v
@@ -176,6 +200,7 @@ smallChooseCached :: Int -> [Int] -> [Int] -> Int -> Int -> Int
 smallChooseCached p facts invfacts n k
   | k < 0 || k > n = 0
   | otherwise      = (((facts !! n) * (invfacts !! k)) `mod` p) * (invfacts !! (n-k)) `mod` p
+{-# INLINE smallChooseCached #-}
 
 binomModP :: Int -> Int -> Int -> Int
 binomModP p n k
@@ -186,7 +211,8 @@ binomModP p n k
           dsK = digitsBase p k
           f ni ki =
             if ki > ni then 0 else smallChooseCached p facts invfacts ni ki
-      in foldl (\acc (ni,ki) -> (acc * f ni ki) `mod` p) 1 (zip dsN (dsK ++ repeat 0))
+      in foldl' (\acc (ni,ki) -> (acc * f ni ki) `mod` p) 1 (zip dsN (dsK ++ repeat 0))
+{-# INLINE binomModP #-}
 
 --------------------------------------------------------------------------------
 -- d^1 (deg -1) + Leibniz
@@ -211,6 +237,7 @@ d1Gen pr@(OddP p) (W [Mu n]) =
         ]
   in normalizePoly pr $ M.fromListWith (addP pr) terms
 d1Gen _ _ = zeroPoly
+{-# INLINE d1Gen #-}
 
 d1 :: Prime -> WordL -> Poly
 d1 pr@(OddP p) (W [])     = zeroPoly
@@ -220,7 +247,7 @@ d1 pr@(OddP p)  (W (g:gs)) =
       v   = W gs
       du  = d1 pr u
       dv  = d1 pr v
-      sgn = if odd (degW p u) then (p-1) else 1
+      sgn = if odd (degW p u) then p-1 else 1
   in addPoly pr (mulRightW pr du v) (scalePoly pr sgn (mulLeftW pr u dv))
 
 --------------------------------------------------------------------------------
@@ -228,7 +255,8 @@ d1 pr@(OddP p)  (W (g:gs)) =
 --------------------------------------------------------------------------------
 
 signPow :: Prime -> Int -> Int
-signPow pr k = if even k then 1 else (unP pr - 1)
+signPow pr k = if even k then 1 else unP pr - 1
+{-# INLINE signPow #-}
 
 ademPair :: Prime -> Gen -> Gen -> Maybe Poly
 ademPair pr@(OddP p) a b =
@@ -336,20 +364,21 @@ reduceWordFull pr w0 = loop (mono pr 1 w0)
                      ]
       in if step == poly then poly else loop step
 
+-- Parallelized: process monomials independently
 reducePolyFull :: Prime -> Poly -> Poly
 reducePolyFull pr poly =
   normalizePoly pr $
-    M.fromListWith (addP pr)
-      (concat
-        [ [ (w', mulP pr c c') | (w',c') <- M.toList (reduceWordFull pr w) ]
-        | (w,c) <- M.toList poly
-        ])
+    M.fromListWith (addP pr) $
+      concat $
+        parMap rdeepseq
+          (\(w,c) -> [ (w', mulP pr c c') | (w',c') <- M.toList (reduceWordFull pr w) ])
+          (M.toList poly)
 
 toAdmissible :: Prime -> WordL -> Poly
 toAdmissible = reduceWordFull
 
 --------------------------------------------------------------------------------
--- Basis by degree (built once)
+-- Basis by degree (built once) — parallelized batched reductions
 --------------------------------------------------------------------------------
 
 gensUpTo :: Int -> Int -> [Gen]
@@ -370,19 +399,19 @@ extendOne pr@(OddP p) cap ws =
 basisByDegree :: Prime -> Int -> Map Int (Set WordL)
 basisByDegree pr@(OddP p) cap = grow (S.singleton (W [])) M.empty
   where
-    insertReduced acc w =
-      let red = reduceWordFull pr w
-      in foldl
-           (\m (w',_) ->
-              let d = degW p w'
-              in if d <= cap
-                   then M.insertWith S.union d (S.singleton w') m
-                   else m)
-           acc (M.toList red)
+    insertReducedOne acc w' =
+      let d = degW p w'
+      in if d <= cap then M.insertWith S.union d (S.singleton w') acc else acc
+
+    -- Batch reduce with parallelism
+    insertReducedBatch =
+      foldl' (\m poly ->
+        foldl' (\m' (w',_) -> insertReducedOne m' w') m (M.toList poly))
 
     grow frontier acc =
-      let next = extendOne pr cap frontier
-          acc' = S.foldl' insertReduced acc next
+      let next    = extendOne pr cap frontier
+          reduced = parMap rdeepseq (reduceWordFull pr) (S.toList next)
+          acc'    = insertReducedBatch acc reduced
       in if S.null next || S.size next == S.size frontier
            then M.delete 0 acc'
            else grow next acc'
@@ -394,71 +423,79 @@ buildBasisBundle
      )
 buildBasisBundle pr cap =
   let table = basisByDegree pr cap
-      lists = M.map (sortBy compare . S.toList) table
+      lists = M.map (sort . S.toList) table
       pos   = M.map (\ws -> M.fromList (zip ws [0..])) lists
   in (lists, pos)
 
 --------------------------------------------------------------------------------
--- Rank: column-wise (default) and row-wise (when cols < rows)
+-- Vectorized rank over F_p
 --------------------------------------------------------------------------------
 
--- Reduce a vector against existing pivots (list of (pivotIdx, pivotVec))
-reduceWithPivots :: Prime -> [(Int,[Int])] -> [Int] -> [Int]
-reduceWithPivots pr pivots v0 =
-  foldl
-    (\v (pi, pv) ->
-        let a = getAtD 0 v pi
-        in if a == 0 then v
+-- Reduce a column vector against existing pivots (each pivot is normalized)
+reduceWithPivotsU :: Prime -> [(Int, Vector Int)] -> Vector Int -> Vector Int
+reduceWithPivotsU pr pivots v0 =
+  foldl' step v0 pivots
+  where
+    step v (!pi, !pv) =
+      let a = if pi < U.length v then U.unsafeIndex v pi else 0
+      in if a == 0
+           then v
            else
              let s = modP pr (negate a)
-             in zipWith (addP pr) v (map (mulP pr s) pv))
-    v0 pivots
+                 pvScaled = U.map (mulP pr s) pv
+             in U.zipWith (addP pr) v pvScaled
+{-# INLINE reduceWithPivotsU #-}
 
-firstNonZero :: [Int] -> Maybe Int
-firstNonZero = go 0
-  where
-    go _ []     = Nothing
-    go i (x:xs) = if x /= 0 then Just i else go (i+1) xs
+firstNonZeroU :: Vector Int -> Maybe Int
+firstNonZeroU v =
+  let n = U.length v
+      go !i | i >= n    = Nothing
+            | otherwise = let x = U.unsafeIndex v i
+                          in if x /= 0 then Just i else go (i+1)
+  in go 0
+{-# INLINE firstNonZeroU #-}
 
--- Column-wise rank: vectors are columns of length = rows
-rankFromColumns :: Prime -> [[Int]] -> Int
-rankFromColumns pr cols =
-  let rows = if null cols then 0 else length (head cols)
-      fit n v = let lv = length v in if lv==n then v else if lv<n then v ++ replicate (n-lv) 0 else take n v
-      colsN   = map (fit rows) cols
-      step (pivots, rk) v =
-        let v' = reduceWithPivots pr pivots v
-        in case firstNonZero v' of
-             Nothing  -> (pivots, rk)
-             Just pi  ->
-               let a   = getAtD 0 v' pi
-                   inv = if a == 0 then 1 else invModPrime pr a
-                   v'' = map (mulP pr inv) v'
-               in ((pi, v'') : pivots, rk + 1)
-  in snd (foldl step ([], 0) colsN)
+-- Column-wise rank for vectors represented as unboxed vectors
+rankFromColumnsU :: Prime -> [Vector Int] -> Int
+rankFromColumnsU pr cols0
+  | null cols0 = 0
+  | otherwise  =
+      let rows   = U.length (head cols0)
+          -- Ensure uniform length (truncate/pad); cheap guards
+          fit v  = let lv = U.length v
+                   in if lv == rows then v
+                      else if lv < rows then v U.++ U.replicate (rows - lv) 0
+                      else U.take rows v
+          cols   = map fit cols0
+          step (!pivots, !rk) v =
+            let v' = reduceWithPivotsU pr pivots v
+            in case firstNonZeroU v' of
+                 Nothing -> (pivots, rk)
+                 Just pi ->
+                   let a   = U.unsafeIndex v' pi
+                       inv = if a == 0 then 1 else invModPrime pr a
+                       v'' = U.map (mulP pr inv) v'
+                   in ((pi, v'') : pivots, rk + 1)
+      in snd (foldl' step ([], 0 :: Int) cols)
 
--- Build one d^1 column (length = |B_{d-1}|) for word w in degree d
-buildD1Column
+-- Build one d^1 column as an unboxed vector of length |B_{d-1}|
+buildD1ColumnU
   :: Prime
   -> Map Int (Map WordL Int) -- pos maps
-  -> Int
+  -> Int                      -- degree d
   -> WordL
-  -> [Int]
-buildD1Column pr posMaps d w =
+  -> Vector Int
+buildD1ColumnU pr posMaps d w =
   let bd1Map = M.findWithDefault M.empty (d-1) posMaps
       rows   = M.size bd1Map
       img    = reducePolyFull pr (d1 pr w)
-      v0     = replicate rows 0
-  in foldl
-       (\vec (w',c) ->
-          case M.lookup w' bd1Map of
-            Nothing -> vec
-            Just r  -> if r >= 0 && r < rows
-                         then setAt r (addP pr (getAtD 0 vec r) c) vec
-                         else vec)
-       v0 (M.toList img)
+      -- Collect (rowIdx, coeff) pairs and accumulate into a dense vector
+      pairs  = [ (r, c)
+               | (w',c) <- M.toList img
+               , Just r <- [M.lookup w' bd1Map] ]
+  in U.accum (addP pr) (U.replicate rows 0) pairs
 
--- Column-wise rank of d^1_d
+-- Column-wise rank of d^1_d (vectorized & parallelized)
 rankD1DegreeColumnwise
   :: Prime
   -> Map Int [WordL]
@@ -471,13 +508,10 @@ rankD1DegreeColumnwise pr basisLists posMaps d =
   in if null bd || rows == 0
        then 0
        else
-         let cols = map (buildD1Column pr posMaps d) bd
-         in rankFromColumns pr cols
+         let cols = parMap rdeepseq (buildD1ColumnU pr posMaps d) bd
+         in rankFromColumnsU pr cols
 
--- Row-wise rank of d^1_d when cols < rows:
---   1) precompute images of all columns (few)
---   2) for each row basis element r in B_{d-1}, build row vector length=cols by reading coefficients
---   3) rank of transpose = rank of original, so run rankFromColumns on these row vectors
+-- Row-wise rank (rank equals rank of transpose). Build rows as dense vectors.
 rankD1DegreeRowwise
   :: Prime
   -> Map Int [WordL]
@@ -492,16 +526,14 @@ rankD1DegreeRowwise pr basisLists posMaps d =
   in if cols == 0 || rows == 0
        then 0
        else
-         let -- precompute images for each column word (few)
-             imgs :: [Poly]
-             imgs = map (\w -> reducePolyFull pr (d1 pr w)) bd
-             -- fast lookup: for row word r, produce vector [ coeff(r in img_j) | j ]
+         let imgs :: [Poly]
+             imgs = parMap rdeepseq (reducePolyFull pr . d1 pr) bd
              coeffIn :: WordL -> Poly -> Int
-             coeffIn r poly = M.findWithDefault 0 r poly
-             rowVec :: WordL -> [Int]
-             rowVec r = map (coeffIn r) imgs
-             rowVectors = map rowVec bd1   -- each vector length = cols (small)
-         in rankFromColumns pr rowVectors
+             coeffIn = M.findWithDefault 0
+             rowVecU :: WordL -> Vector Int
+             rowVecU r = U.fromListN cols (map (coeffIn r) imgs)
+             rowVectors = parMap rdeepseq rowVecU bd1
+         in rankFromColumnsU pr rowVectors
 
 -- Adaptive choice
 rankD1Degree
@@ -514,7 +546,7 @@ rankD1Degree pr basisLists posMaps d =
   let rows = length (M.findWithDefault [] (d-1) basisLists)
       cols = length (M.findWithDefault [] d       basisLists)
   in if cols < rows
-       then rankD1DegreeRowwise  pr basisLists posMaps d
+       then rankD1DegreeRowwise   pr basisLists posMaps d
        else rankD1DegreeColumnwise pr basisLists posMaps d
 
 -- Image dimension of d^1_{d+1}
@@ -530,7 +562,7 @@ imRankD1Next pr basisLists posMaps d =
     else 0
 
 --------------------------------------------------------------------------------
--- Reports
+-- Reports / IO
 --------------------------------------------------------------------------------
 
 showPoly :: Prime -> Poly -> String
@@ -571,7 +603,7 @@ reportRange pr cap = do
   mapM_ (reportDegree pr basisLists posMaps) degrees
 
 --------------------------------------------------------------------------------
--- Demos
+-- Demos / parsing
 --------------------------------------------------------------------------------
 
 stripPrefixASCII :: String -> String -> Maybe String
@@ -621,11 +653,9 @@ printBasisTable pr cap withD1 = do
            putStrLn $ "-- degree " ++ show deg ++ " :"
            mapM_ (\w -> do
                     putStrLn $ "  " ++ show w
-                    if withD1
-                      then do
+                    when withD1 $ do
                         let rhs = reducePolyFull pr (d1 pr w)
                         putStrLn $ "    d^1 = " ++ showPoly pr rhs
-                      else pure ()
                  ) ws
         ) (M.toList basisLists)
   putStrLn ""

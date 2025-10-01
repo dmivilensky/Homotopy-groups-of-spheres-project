@@ -1,6 +1,10 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE LambdaCase #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use camelCase" #-}
+{-# LANGUAGE TupleSections #-}
 
 -- |
 -- | Hall basis / order and reduction to Hall normal form for free Lie algebras.
@@ -32,22 +36,24 @@ module Hall
 import qualified Data.Map.Strict as M
 import           Data.Map.Strict (Map)
 import qualified Data.Set as S
+import qualified Data.IntMap.Strict as IM
 import           Data.List (intercalate, sortBy, foldl')
 import           Data.Ord  (comparing)
 import           GHC.Generics (Generic)
 import           Control.DeepSeq (NFData(..))
 import           Control.Parallel.Strategies
 import           Data.Ratio (Rational, (%), numerator, denominator)
+import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as U
+import           Data.Bifunctor (second)
 
 --------------------------------------------------------------------------------
--- Parallelism tuning (adjust for your machine/workload)
+-- Parallelism tuning
 --------------------------------------------------------------------------------
 
-parChunkPairs   :: Int ; parChunkPairs   = 64  -- for cartesian pairs in bracket
-parChunkComps   :: Int ; parChunkComps   = 64  -- for BCH compositions
-parChunkMaps    :: Int ; parChunkMaps    = 16  -- for merging per-chunk maps
+parChunkPairs   :: Int ; parChunkPairs   = 64
+parChunkComps   :: Int ; parChunkComps   = 64
 
--- Split a list into chunks of (at most) n elements.
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf n xs | n <= 0    = [xs]
               | otherwise = go xs
@@ -72,7 +78,7 @@ weight :: Basic -> Int
 weight (Leaf _)   = 1
 weight (Node l r) = weight l + weight r
 
--- Hall order: primary key is weight, then lexicographic on tree.
+-- Hall compare by (weight, lex)
 hallCompare :: Basic -> Basic -> Ordering
 hallCompare a b =
   case compare (weight a) (weight b) of
@@ -87,10 +93,8 @@ hallCompare a b =
           case hallCompare a1 b1 of
             EQ -> hallCompare a2 b2
             o  -> o
-
 instance Ord Basic where compare = hallCompare
 
--- (u,v) is admissible if u > v and if u = [a,b] then b ≤ v.
 {-# INLINE isHallPair #-}
 isHallPair :: Basic -> Basic -> Bool
 isHallPair u v =
@@ -102,7 +106,7 @@ isHallPair u v =
 genLeaves :: Int -> [Basic]
 genLeaves k = [ Leaf (GenId i) | i <- [1..k] ]
 
--- Build Hall basis up to class c by increasing weight.
+-- Build Hall basis up to class c
 hallBasis :: Int -> Int -> [Basic]
 hallBasis k c
   | k <= 0 || c <= 0 = []
@@ -128,26 +132,45 @@ ppBasic (Leaf (GenId i)) = "x" ++ show i
 ppBasic (Node a b)       = "[" ++ ppBasic a ++ "," ++ ppBasic b ++ "]"
 
 --------------------------------------------------------------------------------
--- Lie over ℤ
+-- Public Lie over ℤ / ℚ (внешнее API как было)
 --------------------------------------------------------------------------------
 
--- NOTE: Public representation kept as Map Basic … to preserve API.
 newtype LieZ = LieZ { unLZ :: Map Basic Integer } deriving (Eq, Show, Generic, NFData)
+newtype LieQ = LieQ { unLQ :: Map Basic Rational } deriving (Eq, Show, Generic, NFData)
 
-zeroLZ :: LieZ
-zeroLZ = LieZ M.empty
-
+-- Публичные smart-конструкторы (нужны многим местам ниже)
 {-# INLINE singletonLZ #-}
 singletonLZ :: Basic -> Integer -> LieZ
-singletonLZ b c = if c == 0 then zeroLZ else LieZ (M.singleton b c)
+singletonLZ b c =
+  if c == 0 then LieZ M.empty else LieZ (M.singleton b c)
+
+{-# INLINE singletonLQ #-}
+singletonLQ :: Basic -> Rational -> LieQ
+singletonLQ b r =
+  if r == 0 then LieQ M.empty else LieQ (M.singleton b r)
+
+
+{-# INLINE addLQ #-}
+addLQ :: LieQ -> LieQ -> LieQ
+addLQ (LieQ a) (LieQ b) = LieQ $ M.filter (/=0) $ M.unionWith (+) a b
 
 {-# INLINE addLZ #-}
 addLZ :: LieZ -> LieZ -> LieZ
 addLZ (LieZ a) (LieZ b) = LieZ $ M.filter (/=0) $ M.unionWith (+) a b
 
+{-# INLINE negLQ #-}
+negLQ :: LieQ -> LieQ
+negLQ (LieQ a) = LieQ (M.map negate a)
+
 {-# INLINE negLZ #-}
 negLZ :: LieZ -> LieZ
 negLZ (LieZ a) = LieZ (M.map negate a)
+
+zeroLQ :: LieQ
+zeroLQ = LieQ M.empty
+
+zeroLZ :: LieZ
+zeroLZ = LieZ M.empty
 
 {-# INLINE scaleLZ #-}
 scaleLZ :: Integer -> LieZ -> LieZ
@@ -155,107 +178,12 @@ scaleLZ s (LieZ a)
   | s == 0    = zeroLZ
   | s == 1    = LieZ a
   | otherwise = LieZ (M.filter (/=0) (M.map (s*) a))
-
--- Merge many maps once (batch) instead of chaining unions.
-{-# INLINE plusManyLZ #-}
-plusManyLZ :: [LieZ] -> LieZ
-plusManyLZ zs =
-  let pairs = concatMap (M.toList . unLZ) zs
-  in LieZ $ M.filter (/=0) $ M.fromListWith (+) pairs
-
-ppLieZ :: LieZ -> String
-ppLieZ (LieZ m)
-  | M.null m  = "0"
-  | otherwise =
-      intercalate " + "
-        [ (if c==1 then "" else show c ++ "*") ++ ppBasic b
-        | (b,c) <- M.toAscList m
-        ]
-
--- Core Hall reduction on basis nodes:
---   For u>v:
---     admissible (u,v)  → [u,v] is a new basic node
---     otherwise (u=[a,b]) → [[a,b],v] = [a,[b,v]] + [[a,v],b]
-{-# INLINE brBasicZ #-}
-brBasicZ :: Int -> Basic -> Basic -> LieZ
-brBasicZ c u v
-  | weight u + weight v > c = zeroLZ
-  | hallCompare u v == EQ   = zeroLZ
-  | hallCompare u v == GT =
-      if isHallPair u v
-        then singletonLZ (Node u v) 1
-        else case u of
-               Leaf _ -> error "brBasicZ: Leaf>v but not admissible"
-               Node a b ->
-                 let !t1 = bracketLZ c (singletonLZ a 1) (brBasicZ c b v)
-                     !t2 = bracketLZ c (brBasicZ c a v) (singletonLZ b 1)
-                 in addLZ t1 t2
-  | otherwise = negLZ (brBasicZ c v u)
-
-{-# INLINE reduceBasic #-}
-reduceBasic :: Int -> Basic -> Basic
-reduceBasic c b = if weight b <= c then b else error "reduceBasic: overweight"
-
--- Efficient bracket over ℤ:
---   • produce contributions per cartesian pair in parallel;
---   • build per-chunk maps once (fromListWith), then fold a small list of maps.
-{-# INLINE bracketLZ #-}
-bracketLZ :: Int -> LieZ -> LieZ -> LieZ
-bracketLZ _ (LieZ a) (LieZ b) | M.null a || M.null b = zeroLZ
-bracketLZ c (LieZ a) (LieZ b) =
-  let pairs = [ (u,ca,v,cb) | (u,ca) <- M.toList a, (v,cb) <- M.toList b ]
-      mkChunk :: [(Basic,Integer,Basic,Integer)] -> LieZ
-      mkChunk ps =
-        let contribs =
-              concat
-                [ let !coef = ca * cb
-                      !lz   = unLZ (brBasicZ c u v)
-                  in [ (w, coef * k) | (w,k) <- M.toList lz ]
-                | (u,ca,v,cb) <- ps
-                ]
-        in LieZ $ M.filter (/=0) $ M.fromListWith (+) contribs
-      maps =
-        ( map mkChunk (chunksOf parChunkPairs pairs)
-          `using` parList rdeepseq )
-  in foldl' addLZ zeroLZ maps
-
-leafZ :: Int -> LieZ
-leafZ i = singletonLZ (Leaf (GenId i)) 1
-
---------------------------------------------------------------------------------
--- Lie over ℚ + BCH
---------------------------------------------------------------------------------
-
-newtype LieQ = LieQ { unLQ :: Map Basic Rational } deriving (Eq, Show, Generic, NFData)
-
-zeroLQ :: LieQ
-zeroLQ = LieQ M.empty
-
-{-# INLINE singletonLQ #-}
-singletonLQ :: Basic -> Rational -> LieQ
-singletonLQ b c = if c == 0 then zeroLQ else LieQ (M.singleton b c)
-
-{-# INLINE addLQ #-}
-addLQ :: LieQ -> LieQ -> LieQ
-addLQ (LieQ a) (LieQ b) = LieQ $ M.filter (/=0) $ M.unionWith (+) a b
-
-{-# INLINE negLQ #-}
-negLQ :: LieQ -> LieQ
-negLQ (LieQ a) = LieQ (M.map negate a)
-
 {-# INLINE scaleLQ #-}
 scaleLQ :: Rational -> LieQ -> LieQ
 scaleLQ s (LieQ a)
   | s == 0    = zeroLQ
   | s == 1    = LieQ a
   | otherwise = LieQ (M.filter (/=0) (M.map (s*) a))
-
--- Batch aggregation over ℚ.
-{-# INLINE plusManyLQ #-}
-plusManyLQ :: [LieQ] -> LieQ
-plusManyLQ zs =
-  let pairs = concatMap (M.toList . unLQ) zs
-  in LieQ $ M.filter (/=0) $ M.fromListWith (+) pairs
 
 ppLieQ :: LieQ -> String
 ppLieQ (LieQ m)
@@ -266,32 +194,14 @@ ppLieQ (LieQ m)
           ++ ppBasic b
         | (b,r) <- M.toAscList m
         ]
-
-{-# INLINE brBasicQ #-}
-brBasicQ :: Int -> Basic -> Basic -> LieQ
-brBasicQ c u v = LieQ (M.map fromInteger (unLZ (brBasicZ c u v)))
-
--- Efficient bracket over ℚ with chunked parallelism and batch aggregation.
-{-# INLINE bracketLQ #-}
-bracketLQ :: Int -> LieQ -> LieQ -> LieQ
-bracketLQ c (LieQ a) (LieQ b)
-  | M.null a || M.null b = zeroLQ
+ppLieZ :: LieZ -> String
+ppLieZ (LieZ m)
+  | M.null m  = "0"
   | otherwise =
-      let pairs = [ (u,ca,v,cb) | (u,ca) <- M.toList a, (v,cb) <- M.toList b ]
-          mkChunk :: [(Basic,Rational,Basic,Rational)] -> LieQ
-          mkChunk ps =
-            let contribs =
-                  concat
-                    [ let !coef = ca * cb
-                          !lz   = unLQ (brBasicQ c u v)
-                      in [ (w, coef * k) | (w,k) <- M.toList lz ]
-                    | (u,ca,v,cb) <- ps
-                    ]
-            in LieQ $ M.filter (/=0) $ M.fromListWith (+) contribs
-          maps =
-            ( map mkChunk (chunksOf parChunkPairs pairs)
-              `using` parList rdeepseq )
-      in foldl' addLQ zeroLQ maps
+      intercalate " + "
+        [ (if c==1 then "" else show c ++ "*") ++ ppBasic b
+        | (b,c) <- M.toAscList m
+        ]
 
 {-# INLINE toQ #-}
 toQ :: LieZ -> LieQ
@@ -301,7 +211,191 @@ toQ (LieZ m) = LieQ (M.map fromInteger m)
 truncateByWeightQ :: Int -> LieQ -> LieQ
 truncateByWeightQ w (LieQ m) = LieQ (M.filterWithKey (\b _ -> weight b <= w) m)
 
--- Bernoulli via Akiyama–Tanigawa (B1 produced as +1/2) then flipped to B1=-1/2.
+--------------------------------------------------------------------------------
+-- BasisEnv: внутренние ID, веса и быстрые карты
+--------------------------------------------------------------------------------
+
+data BasisEnv = BasisEnv
+  { beNodeOf   :: !(Int -> Basic)        -- id -> Basic
+  , beIdOf     :: !(Basic -> Int)        -- Basic -> id
+  , beWeightV  :: !(U.Vector Int)        -- weight per id
+  }
+
+-- Построить окружение для заданного k (макс. генератор) и класса c
+buildEnv :: Int -> Int -> BasisEnv
+buildEnv k c =
+  let basis = hallBasis k c
+      n     = length basis
+      nodeV = V.fromList basis
+      wV    = U.generate n (\i -> weight (nodeV V.! i))
+      idMap = M.fromList (zip basis [0..])
+      beId x = M.findWithDefault (error "beIdOf: unknown node") x idMap
+      beNode i | i >= 0 && i < n = nodeV V.! i
+               | otherwise       = error "beNodeOf: bad id"
+  in BasisEnv { beNodeOf = beNode, beIdOf = beId, beWeightV = wV }
+
+-- Определить k (максимальный номер генератора) из терма
+maxGenInBasic :: Basic -> Int
+maxGenInBasic = \case
+  Leaf (GenId i) -> i
+  Node a b       -> max (maxGenInBasic a) (maxGenInBasic b)
+
+maxGenInMap :: Map Basic t -> Int
+maxGenInMap m = foldl' (\acc b -> max acc (maxGenInBasic b)) 1 (M.keys m)
+
+--------------------------------------------------------------------------------
+-- Локальное мемо для разложения [u,v] в базис (в ID-пространстве)
+--------------------------------------------------------------------------------
+
+type LZ' = IM.IntMap Integer
+type LQ' = IM.IntMap Rational
+
+-- уникальные пары (сохраним порядок u>v/иное в brBasic*)
+uniquePairs :: (Ord a, Ord b) => [(a,b)] -> [(a,b)]
+uniquePairs xs = M.keys (M.fromList (map (, ()) xs))
+
+-- базовый расчёт через старое brBasicZ на Basic, затем конверт в ID-вектор
+brBasicZ_BASIC :: Int -> Basic -> Basic -> LieZ
+brBasicZ_BASIC c u v
+  | weight u + weight v > c = zeroLZ
+  | hallCompare u v == EQ   = zeroLZ
+  | hallCompare u v == GT =
+      if isHallPair u v
+        then singletonLZ (Node u v) 1
+        else case u of
+               Leaf _ -> error "brBasicZ: Leaf>v but not admissible"
+               Node a b ->
+                 let t1 = bracketLZ c (singletonLZ a 1) (brBasicZ_BASIC c b v)
+                     t2 = bracketLZ c (brBasicZ_BASIC c a v) (singletonLZ b 1)
+                 in addLZ t1 t2
+  | otherwise = negLZ (brBasicZ_BASIC c v u)
+
+-- Построить кэш для набора пар на ID: (i,j) -> IntMap (id -> coef)
+buildBrMemoIdZ :: BasisEnv -> Int -> [(Int,Int)] -> M.Map (Int,Int) LZ'
+buildBrMemoIdZ be c pairs =
+  let toIdMap (LieZ m) =
+        IM.fromListWith (+)
+          [ (beIdOf be b, coef) | (b,coef) <- M.toList m, coef /= 0 ]
+      mk (i,j) =
+        let u = beNodeOf be i; v = beNodeOf be j
+        in ((i,j), toIdMap (brBasicZ_BASIC c u v))
+      chunks = chunksOf parChunkPairs pairs
+      parts =
+        ( map (M.fromList . map mk) chunks
+          `using` parList rdeepseq )
+  in foldl' (M.unionWith const) M.empty parts
+
+--------------------------------------------------------------------------------
+-- Конвертация между публичным и внутренним представлением
+--------------------------------------------------------------------------------
+
+toIntMapZ :: BasisEnv -> LieZ -> LZ'
+toIntMapZ be (LieZ m) =
+  IM.fromListWith (+) [ (beIdOf be b, c) | (b,c) <- M.toList m, c /= 0 ]
+
+toIntMapQ :: BasisEnv -> LieQ -> LQ'
+toIntMapQ be (LieQ m) =
+  IM.fromListWith (+) [ (beIdOf be b, r) | (b,r) <- M.toList m, r /= 0 ]
+
+fromIntMapZ :: BasisEnv -> LZ' -> LieZ
+fromIntMapZ be im =
+  LieZ $ M.fromList
+      [ (beNodeOf be i, c) | (i,c) <- IM.toList im, c /= 0 ]
+fromIntMapQ :: BasisEnv -> LQ' -> LieQ
+fromIntMapQ be im =
+  LieQ $ M.fromList
+      [ (beNodeOf be i, r) | (i,r) <- IM.toList im, r /= 0 ]
+
+plusManyIMZ :: [LZ'] -> LZ'
+plusManyIMZ zs = IM.fromListWith (+) (concatMap IM.toList zs)
+plusManyIMQ :: [LQ'] -> LQ'
+plusManyIMQ zs = IM.fromListWith (+) (concatMap IM.toList zs)
+
+--------------------------------------------------------------------------------
+-- Внутренние скобки на ID с локальным кэшем
+--------------------------------------------------------------------------------
+
+-- Публичная: скобка над ℤ, используя внутренний движок.
+{-# INLINE bracketLZ #-}
+bracketLZ :: Int -> LieZ -> LieZ -> LieZ
+bracketLZ c aZ bZ
+  | M.null (unLZ aZ) || M.null (unLZ bZ) = zeroLZ
+  | otherwise =
+      let k = max (maxGenInMap (unLZ aZ)) (maxGenInMap (unLZ bZ))
+          be = buildEnv k c
+          aI = toIntMapZ be aZ
+          bI = toIntMapZ be bZ
+          al = IM.toList aI
+          bl = IM.toList bI
+          pairsIJ = uniquePairs [ (i,j) | (i,_) <- al, (j,_) <- bl ]
+          memo   = buildBrMemoIdZ be c pairsIJ
+
+          mkChunk :: [(Int,Integer,Int,Integer)] -> LZ'
+          mkChunk ps =
+            let contribs =
+                  concat
+                    [ let !coef = ca * cb
+                      in if coef == 0
+                           then []
+                           else
+                             case M.lookup (i,j) memo of
+                               Nothing   -> []
+                               Just term -> [ (w, coef * k) | (w,k) <- IM.toList term, k /= 0 ]
+                    | (i,ca,j,cb) <- ps
+                    ]
+            in IM.fromListWith (+) contribs
+
+          cart = [ (i,ca,j,cb) | (i,ca) <- al, (j,cb) <- bl ]
+          parts =
+            ( map mkChunk (chunksOf parChunkPairs cart)
+              `using` parList rdeepseq )
+      in fromIntMapZ be (plusManyIMZ parts)
+
+-- Публичная: скобка над ℚ через тот же кэш (цель — не дублировать разложения).
+{-# INLINE bracketLQ #-}
+bracketLQ :: Int -> LieQ -> LieQ -> LieQ
+bracketLQ c aQ bQ
+  | M.null (unLQ aQ) || M.null (unLQ bQ) = zeroLQ
+  | otherwise =
+      let k = max (maxGenInMap (M.map (const ()) (unLQ aQ)))
+                  (maxGenInMap (M.map (const ()) (unLQ bQ)))
+          be = buildEnv k c
+          aI = toIntMapQ be aQ
+          bI = toIntMapQ be bQ
+          al = IM.toList aI
+          bl = IM.toList bI
+          pairsIJ = uniquePairs [ (i,j) | (i,_) <- al, (j,_) <- bl ]
+          memo   = buildBrMemoIdZ be c pairsIJ
+
+          mkChunk :: [(Int,Rational,Int,Rational)] -> LQ'
+          mkChunk ps =
+            let contribs =
+                  concat
+                    [ let !coef = ca * cb
+                      in if coef == 0
+                           then []
+                           else
+                             case M.lookup (i,j) memo of
+                               Nothing   -> []
+                               Just term ->
+                                 [ (w, coef * fromInteger k0)
+                                 | (w,k0) <- IM.toList term, k0 /= 0
+                                 ]
+                    | (i,ca,j,cb) <- ps
+                    ]
+            in IM.fromListWith (+) contribs
+
+          cart = [ (i,ca,j,cb) | (i,ca) <- al, (j,cb) <- bl ]
+          parts =
+            ( map mkChunk (chunksOf parChunkPairs cart)
+              `using` parList rdeepseq )
+      in fromIntMapQ be (plusManyIMQ parts)
+
+--------------------------------------------------------------------------------
+-- BCH (Casas–Murua) на ℚ с внутренним представлением
+--------------------------------------------------------------------------------
+
+-- Bernoulli via Akiyama–Tanigawa (B1 produced as +1/2) then flipped to -1/2.
 bernoullisAT :: Int -> [Rational]
 bernoullisAT n = map bern [0..n]
   where
@@ -314,94 +408,88 @@ bernoullisAT n = map bern [0..n]
             in take (j-1) a ++ [ajm1'] ++ drop j a
           aFinal = foldl' step initA [m,m-1..1]
       in head aFinal
-
-{-# INLINE fixB1 #-}
 fixB1 :: [Rational] -> [Rational]
 fixB1 (b0:b1:rest) = b0 : (-b1) : rest
 fixB1 xs           = xs
 
--- ad-chain with early pruning: if any intermediate becomes zero, stop early.
-{-# INLINE adChain #-}
-adChain :: Int -> [LieQ] -> LieQ -> LieQ
-adChain c ops v0 = go (reverse ops) v0
+-- ad-chain (внутренний, на ID)
+adChainI :: Int -> BasisEnv -> [LQ'] -> LQ' -> LQ'
+adChainI c be ops = go (reverse ops)
   where
     go []     !acc = acc
     go (u:us) !acc =
-      let !acc' = bracketLQ c u acc
-      in if M.null (unLQ acc') then zeroLQ else go us acc'
+      let !acc' = bracketI c be u acc
+      in if IM.null acc' then IM.empty else go us acc'
+    -- скобка для внутренних представлений (без пересборки LieQ)
+    bracketI :: Int -> BasisEnv -> LQ' -> LQ' -> LQ'
+    bracketI cc be' l r
+      | IM.null l || IM.null r = IM.empty
+      | otherwise =
+          toIntMapQ be' ( bracketLQ cc (fromIntMapQ be' l) (fromIntMapQ be' r) )
 
--- compositions of 'total' into exactly k positive parts (memoized by caller).
-{-# INLINE compositionsK #-}
+-- compositions of 'total' into exactly k positive parts
 compositionsK :: Int -> Int -> [[Int]]
 compositionsK total k
-  | k <= 0          = []
-  | k == 1          = if total >= 1 then [[total]] else []
-  | otherwise       = [ i:rest
-                      | i <- [1 .. total - (k-1)]
-                      , rest <- compositionsK (total - i) (k-1)
-                      ]
+  | k <= 0    = []
+  | k == 1    = [[total] | total >= 1]
+  | otherwise = [ i:rest
+                | i <- [1 .. total - (k-1)]
+                , rest <- compositionsK (total - i) (k-1)
+                ]
 
--- BCH up to class c:
---   Z = Σ_{n≥1} Z_n, deg(Z_n)=n
---   Z_1 = X + Y
---   Z_n = (1/n) Σ_{k=1}^{n-1} (B_k/k!) Σ_{i_1+…+i_k=n-1}
---            ad_{Z_{i_1}} … ad_{Z_{i_k}} (X + (-1)^k Y).
--- Parallelization:
---   • inner sums over compositions are mapped in parallel (chunked);
---   • per-k results are aggregated in batches before the outer fold.
 bchQ :: Int -> LieQ -> LieQ -> LieQ
-bchQ c x y
+bchQ c x0 y0
   | c <= 0    = zeroLQ
   | otherwise =
-      let !bnums    = fixB1 (bernoullisAT (c-1))  -- B0..B_{c-1}
-          !factList = scanl (*) 1 [1..]           -- 0!,1!,2!,…
-          !z1       = addLQ x y
+      let k = max (maxGenInMap (M.map (const ()) (unLQ x0)))
+                  (maxGenInMap (M.map (const ()) (unLQ y0)))
+          be = buildEnv k c
+          xI = toIntMapQ be x0
+          yI = toIntMapQ be y0
+          bnums    = fixB1 (bernoullisAT (c-1))     -- B0..B_{c-1}
+          factList = scanl (*) 1 [1..] :: [Int]     -- 0!,1!,2!,…
+          z1I      = IM.unionWith (+) xI yI
 
-          -- Memo table for compositions reused across all n,k (saves a lot of list work).
-          compMemo :: Map (Int,Int) [[Int]]
+          -- memo композиций
+          compMemo :: M.Map (Int,Int) [[Int]]
           compMemo =
-            let keys  = [ (n-1,k) | n <- [2..c], k <- [1..n-1] ]
-                items = [ ((t,k), compositionsK t k) | (t,k) <- keys ]
+            let keys  = [ (n-1,k') | n <- [2..c], k' <- [1..n-1] ]
+                items = [ ((t,k'), compositionsK t k') | (t,k') <- keys ]
             in M.fromList items
 
-          build :: Int -> [LieQ] -> [LieQ]
+          build :: Int -> [LQ'] -> [LQ']
           build n acc
             | n > c     = []
             | otherwise =
                 let ks = [1 .. n-1]
-
-                    sumK :: LieQ
+                    sumK :: LQ'
                     sumK =
                       let piecesPerK =
-                            [ let bk    = bnums !! k
-                                  kfacI = factList !! k
+                            [ let bk    = bnums !! k'
+                                  kfacI = factList !! k'
                                   coef  = bk / fromIntegral kfacI
-                                  baseV = if odd k then addLQ x (negLQ y) else addLQ x y
-                                  comps = M.findWithDefault [] (n-1,k) compMemo
-
-                                  -- Evaluate ad-chains for all compositions in parallel,
-                                  -- batch-aggregate into few maps, then scale by coef.
-                                  part :: LieQ
-                                  part =
+                                  baseV = if odd k' then IM.unionWith (+) xI (IM.map negate yI)
+                                                     else IM.unionWith (+) xI yI
+                                  comps = M.findWithDefault [] (n-1,k') compMemo
+                                  part  =
                                     let perChunk =
                                           ( map (\chunk ->
-                                                   plusManyLQ
-                                                     [ adChain c (map (\r -> acc !! (r-1)) parts) baseV
+                                                   plusManyIMQ
+                                                     [ adChainI c be (map (\r -> acc !! (r-1)) parts) baseV
                                                      | parts <- chunk
                                                      ])
                                                 (chunksOf parChunkComps comps)
                                             `using` parList rdeepseq )
-                                    in scaleLQ coef (plusManyLQ perChunk)
+                                    in IM.map (* coef) (plusManyIMQ perChunk)
                               in part
-                            | k <- ks
+                            | k' <- ks
                             ]
-                      in plusManyLQ piecesPerK
-
-                    zn = scaleLQ (1 % fromIntegral n) sumK
+                      in plusManyIMQ piecesPerK
+                    zn = IM.map (* (1 % fromIntegral n)) sumK
                 in zn : build (n+1) (acc ++ [zn])
 
-          zs = z1 : build 2 [z1]
-      in foldl' addLQ zeroLQ zs
+          zsI = z1I : build 2 [z1I]
+      in fromIntMapQ be (plusManyIMQ zsI)
 
 --------------------------------------------------------------------------------
 -- Nilpotent group (Hall / Mal’cev NF)
@@ -442,23 +530,25 @@ binom n k
       let k' = min k (n-k)
       in foldl' (\acc i -> (acc * (n - i + 1)) `div` i) 1 [1..k']
 
+leafZ :: Int -> LieZ
+leafZ i = singletonLZ (Leaf (GenId i)) 1
+
 insertLieZRight :: Int -> GroupNF -> LieZ -> GroupNF
 insertLieZRight c nf (LieZ m)
   | M.null m  = nf
-  | otherwise = M.foldlWithKey' (\acc b e -> insertManyRight c acc b e) nf m
+  | otherwise = M.foldlWithKey' (insertManyRight c) nf m
 
--- [v,u^e] = Π_{k≥1} (ad_u^k v)^{binom(e,k)} (up to class c).
--- Uses the Lie bracket above; the pruning by class c keeps this bounded.
+-- [v,u^e] = Π_{k≥1} (ad_u^k v)^{binom(e,k)} (до класса c).
 commPower :: Int -> Basic -> Basic -> Integer -> GroupNF
 commPower c v u e
   | e == 0    = identityG
   | otherwise =
-      let !vZ     = singletonLZ v 1
-          !uZ     = singletonLZ u 1
-          !wv     = weight v
-          !wu     = weight u
-          !kmax   = max 0 ((c - wv) `div` wu)
-          !start1 = bracketLZ c vZ uZ
+      let vZ     = singletonLZ v 1
+          uZ     = singletonLZ u 1
+          wv     = weight v
+          wu     = weight u
+          kmax   = max 0 ((c - wv) `div` wu)
+          start1 = bracketLZ c vZ uZ
           go :: Int -> GroupNF -> LieZ -> Integer -> GroupNF
           go !k !accNF !curr !chooseEK
             | k > kmax           = accNF
@@ -470,7 +560,7 @@ commPower c v u e
                     !accNF'    = insertLieZRight c accNF (scaleLZ chooseEK' curr)
                     !next      = bracketLZ c curr uZ
                 in go (k+1) accNF' next chooseEK'
-          !nfTmp  = go 1 identityG start1 1
+          nfTmp  = go 1 identityG start1 1
       in canonicalizeNF nfTmp
 
 insertManyRight :: Int -> GroupNF -> Basic -> Integer -> GroupNF
@@ -482,33 +572,36 @@ insertManyRight c nf b e
     iter 0 acc = acc
     iter m acc = iter (m-1) (insertOnceRight c acc b)
 
+-- Переписанный «пузырёк» через разностные списки (без splitAt/многих ++).
 insertOnceRight :: Int -> GroupNF -> Basic -> GroupNF
 insertOnceRight c (GroupNF xs0) b =
-  let xs1   = xs0 ++ [(b,1)]
-      fixed = bubbleLeft xs1 (length xs1 - 2)
-  in canonicalizeNF (GroupNF fixed)
-  where
-    bubbleLeft xs i
-      | i < 0 = xs
-      | otherwise =
-          let (pre,(u,eu),(v,ev),suf) = split3 xs i
-          in if hallCompare u v == GT
-               then
-                 let commVUe = commPower c v u eu
-                     corrInv = groupInv commVUe
-                     xs'     = pre ++ [(v,ev),(u,eu)] ++ unG corrInv ++ suf
-                 in bubbleLeft xs' (i-1)
-               else bubbleLeft xs (i-1)
-
-    split3 :: [a] -> Int -> ([a], a, a, [a])
-    split3 xs i =
-      let (pre, rest) = splitAt i xs
-      in case rest of
-           (a:b':suf) -> (pre, a, b', suf)
-           _          -> error "split3: index out of range"
+  let xs1 = xs0 ++ [(b,1)]  -- единственный неизбежный ++ на добавление справа
+      -- go проходит слева направо, двигая вставленный элемент влево при необходимости.
+      go :: ([(Basic,Integer)] -> [(Basic,Integer)])  -- dlist для префикса
+         -> [(Basic,Integer)]                         -- текущий остаток
+         -> GroupNF
+      go pre lst =
+        case lst of
+          -- минимум два элемента, чтобы потенциально свапнуть
+          (u,eu):(v,ev):suf
+            | hallCompare u v == GT ->
+                -- нужно поменять местами u и v и добавить коррекцию
+                let commVUe = commPower c v u eu
+                    corrInv = groupInv commVUe
+                    -- собираем новую «фронтовую» часть без аллокаций хвостов
+                    newFront = pre . (\xs -> (v,ev) : (u,eu) : xs) . (unG corrInv ++)
+                in go newFront suf
+            | otherwise ->
+                -- порядок нормальный, «зафиксировать» u и двигаться дальше
+                go (pre . ((u,eu):)) ((v,ev):suf)
+          -- остался один элемент — дописываем и каноникализуем
+          [x] -> canonicalizeNF (GroupNF (pre [x]))
+          -- пусто — уже собрали всё
+          []  -> canonicalizeNF (GroupNF (pre []))
+  in go id xs1
 
 groupInv :: GroupNF -> GroupNF
-groupInv (GroupNF xs) = GroupNF (map (\(b,e)->(b, negate e)) (reverse xs))
+groupInv (GroupNF xs) = GroupNF (map (second negate) (reverse xs))
 
 groupMul :: Int -> GroupNF -> GroupNF -> GroupNF
 groupMul c (GroupNF a) (GroupNF b) =
@@ -531,12 +624,9 @@ groupComm c g h = groupMul c (groupMul c (groupInv g) (groupInv h))
                            (groupMul c g h)
 
 --------------------------------------------------------------------------------
--- Smith Normal Form (integer)
+-- Smith Normal Form (минимизация роста коэффициентов — выбор малого пивота)
 --------------------------------------------------------------------------------
 
--- A small but impactful improvement: pick a pivot of minimal |a_ij|
--- in the remaining submatrix rather than “first non-zero”. This reduces
--- growth of intermediate values and number of Euclidean steps.
 smithNormalForm :: [[Integer]] -> ([[Integer]], [[Integer]], [[Integer]])
 smithNormalForm a0 =
   let m  = length a0
@@ -561,8 +651,6 @@ smithNormalForm a0 =
                       let (u3, a3, v3) = clear i j u1 a2 v1
                       in go (i+1) (j+1) u3 a3 v3
 
-    -- Pick the position of the smallest non-zero entry by absolute value
-    -- in the submatrix i.., j..
     pivotMinAbs :: Int -> Int -> [[Integer]] -> Maybe (Int,Int)
     pivotMinAbs i j a =
       let rs = [i .. nRows a - 1]
@@ -572,7 +660,6 @@ smithNormalForm a0 =
            [] -> Nothing
            _  -> let (r,c,_) = minimumBy3 nz in Just (r,c)
 
-    -- Extended gcd: s*a + t*b = g = gcd(a,b), g >= 0
     egcd :: Integer -> Integer -> (Integer, Integer, Integer)
     egcd a b = go (abs a) (abs b) 1 0 0 1
       where
@@ -582,18 +669,14 @@ smithNormalForm a0 =
               let q  = r0 `quot` r1
               in go r1 (r0 - q*r1) s1 t1 (s0 - q*s1) (t0 - q*t1)
 
-    -- 2×2 unimodular row-combo on rows i and r:
-    --   [ s  t ] * [row_i] = new row_i,  a_ij -> g
-    --   [-b' a']   [row_r] = new row_r,  a_rj -> 0
-    -- where a' = a_ij/g, b' = a_rj/g.
     rowComb2 :: Int -> Int -> Integer -> Integer -> [[Integer]] -> [[Integer]]
              -> ([[Integer]], [[Integer]])
     rowComb2 i r aij arj a u =
       let (g,s,t) = egcd aij arj
           a' = aij `quot` g
           b' = arj `quot` g
-          lin1 rowi rowr = zipWith (\x y -> s*x + t*y) rowi rowr
-          lin2 rowi rowr = zipWith (\x y -> (-b')*x + a'*y) rowi rowr
+          lin1 = zipWith (\x y -> s*x + t*y)
+          lin2 = zipWith (\x y -> (-b')*x + a'*y)
           replaceRows m =
             let ri  = m!!i; rr  = m!!r
                 ri' = lin1 ri rr
@@ -603,15 +686,14 @@ smithNormalForm a0 =
           u'new = replaceRows u
       in (u'new, a'new)
 
-    -- 2×2 unimodular col-combo on cols j and c (via transposes).
     colComb2 :: Int -> Int -> Integer -> Integer -> [[Integer]] -> [[Integer]]
              -> ([[Integer]], [[Integer]])
     colComb2 j c aij aic a v =
       let (g,s,t) = egcd aij aic
           a' = aij `quot` g
           b' = aic `quot` g
-          lin1 colj colc = zipWith (\x y -> s*x + t*y) colj colc
-          lin2 colj colc = zipWith (\x y -> (-b')*x + a'*y) colj colc
+          lin1 = zipWith (\x y -> s*x + t*y)
+          lin2 = zipWith (\x y -> (-b')*x + a'*y)
           aT = transpose' a
           vT = transpose' v
           (vT', aT') =
@@ -622,7 +704,6 @@ smithNormalForm a0 =
             in (repl vT, repl aT)
       in (transpose' vT', transpose' aT')
 
-    -- Euclidean clear on (row i, col j).
     clear i j u a v =
       let fixSign (uM,aM) =
             if aM!!i!!j < 0
@@ -648,11 +729,10 @@ smithNormalForm a0 =
           (u2,a3)   = fixSign (u1,a2)
       in (u2, a3, v1)
 
-    -- tiny matrix utilities
-    nRows mtx = length mtx
+    nRows = length
     nCols mtx = if null mtx then 0 else length (head mtx)
     ident k = [ [ if r==c then 1 else 0 | c <- [0..k-1] ] | r <- [0..k-1] ]
-    rowSwap r1 r2 mtx = swapBy r1 r2 mtx
+    rowSwap = swapBy
     colSwap c1 c2 mtx = transpose' (swapBy c1 c2 (transpose' mtx))
     negRow r mtx = setRow r (map negate (mtx!!r)) mtx
     setRow r new mtx = [ if i==r then new else mtx!!i | i <- [0..nRows mtx - 1] ]
@@ -679,7 +759,7 @@ smithDiag d =
   in [ d!!i!!i | i <- [0..k-1], d!!i!!i /= 0 ]
 
 --------------------------------------------------------------------------------
--- Utilities & tests (kept identical in spirit to original)
+-- Utilities & tests
 --------------------------------------------------------------------------------
 
 dimByWeight :: Int -> Int -> [(Int, Int)]
@@ -701,7 +781,7 @@ testLieIdentities = do
       x1 = leafZ 1
       x2 = leafZ 2
       x3 = leafZ 3
-      br a b = bracketLZ c a b
+      br = bracketLZ c
       zero   = zeroLZ
       anti a b = assert (addLZ (br a b) (br b a) == zero) "antisym failed"
       jac a b d =

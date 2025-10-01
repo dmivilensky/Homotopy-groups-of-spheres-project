@@ -208,7 +208,7 @@ abelianExponentSums = foxJacobianZ
 isAbelianCommutatorCandidate :: Presentation -> Bool
 isAbelianCommutatorCandidate p =
   let rows = abelianExponentSums p
-      zeroRow v = all (==0) v
+      zeroRow = all (==0)
       allRelsZero = all zeroRow rows
       prodRel = foldl' F.wMul F.wOne (rels p)
       prodRow = F.jacobianZ (gens p) [prodRel]

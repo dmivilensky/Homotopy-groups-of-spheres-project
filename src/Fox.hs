@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveGeneric #-}
 
 --
 -- * Core types:
@@ -37,6 +36,7 @@ import qualified Data.Map.Strict as M
 import           Data.Maybe              (fromMaybe)
 import           Data.Text               (Text)
 import qualified Data.Text as T
+import           Data.Bifunctor          (first)
 
 --------------------------------------------------------------------------------
 -- Minimal p-adic helper (vpZ) to avoid extra deps
@@ -178,7 +178,7 @@ zfScale s = M.filter (/=0) . M.map (s *)
 leftMul :: WordF -> ZF -> ZF
 leftMul w =
   M.filter (/=0) . M.fromListWith (+)  -- оба варианта ок:
-    . map (\(g,c) -> (w `wMul` g, c))  -- 1) чистая композиция
+    . map (first (w `wMul`))            -- 1) чистая композиция
     . M.toList                          --    без промежуточного списка
 -- или короче: leftMul w = M.filter (/=0) . M.fromListWith (+) . map (\(g,c)->(w `wMul` g,c)) . M.toList
 
@@ -295,7 +295,7 @@ pAdicMaxNorm :: Integer -> ZF -> Double
 pAdicMaxNorm p z
   | M.null z  = 0
   | otherwise =
-      let mags = [ (fromIntegral p) ** fromIntegral (negate (vpZ p c)) | (_,c) <- M.toList z, c /= 0 ]
+      let mags = [ fromIntegral p ** fromIntegral (negate (vpZ p c)) | (_,c) <- M.toList z, c /= 0 ]
       in if null mags then 0 else maximum mags
 
 --------------------------------------------------------------------------------
@@ -317,7 +317,7 @@ softMembershipScore
   -> WordF         -- ^ w
   -> Integer       -- ^ score ≥ 0 (0 means perfectly matched under the heuristic)
 softMembershipScore phi alphabet sSet w =
-  let basisDx  = [ (x, map (\s -> pushForward phi (foxD x s)) sSet) | x <- alphabet ]
+  let basisDx  = [ (x, map (pushForward phi . foxD x) sSet) | x <- alphabet ]
       targetDx = [ (x, pushForward phi (foxD x w))                  | x <- alphabet ]
       scoreOne (x, tw) =
         let gens = fromMaybe [] (lookup x basisDx)
@@ -389,7 +389,7 @@ foxRowForRel xs r = [ foxD (T.pack x) r | x <- xs ]
 
 -- | Полный Фокс-Якобиан презентации (|R| × |X|) как элементы Z[F].
 jacobian :: [String] -> [WordF] -> [[ZF]]
-jacobian xs rs = map (foxRowForRel xs) (map normalize rs)
+jacobian xs = map (foxRowForRel xs . normalize)
 {-# INLINE jacobian #-}
 
 -- | Аугментация ε: Z[F] → Z (сумма коэффициентов).
@@ -399,7 +399,7 @@ augment = sum . M.elems
 
 -- | Целочисленный Якобиан ε∘∂: каждая запись — сумма коэффициентов соответствующего Z[F].
 jacobianZ :: [String] -> [WordF] -> [[Integer]]
-jacobianZ xs rs = map (map augment . foxRowForRel xs) (map normalize rs)
+jacobianZ xs = map ((map augment . foxRowForRel xs) . normalize)
 {-# INLINE jacobianZ #-}
 
 comm :: WordF -> WordF -> WordF

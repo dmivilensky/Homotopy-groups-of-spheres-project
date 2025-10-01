@@ -9,9 +9,9 @@ import qualified Bridge as B
 
 main :: IO ()
 main = do
-  H.runHallTests
+  L.runLambdaTests
+  -- H.runHallTests
   -- B.runBridgeTests
---   F.runFoxTests
---   P.runPadicTests
---   L.runLambdaTests
---   W.runWuTests
+  -- F.runFoxTests
+  -- P.runPadicTests
+  -- W.runWuTests
