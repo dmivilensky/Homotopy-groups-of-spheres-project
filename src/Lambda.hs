@@ -18,6 +18,7 @@ module Lambda
   , toAdmissible, d1, degW, parseWord
   , reducePolyFull, buildBasisBundle
   , runLambdaTests
+  , renderWord
   ) where
 
 import qualified Data.Map.Strict as M
@@ -114,6 +115,16 @@ instance NFData WordL where
 instance Show WordL where
   show (W [])   = "1"
   show (W gens) = unwords (map show gens)
+
+-- | Textual rendering compatible with 'parseWord'.
+--   NOTE: Empty word renders to an empty line (""), not "1",
+--   so that a round-trip (render -> parseWord) succeeds:
+--     parseWord "" == Just (W [])
+--     parseWord "lambda3 mu2" == Just (W [Lam 2, Mu 1])
+renderWord :: WordL -> String
+renderWord (W [])   = ""
+renderWord (W gens) = unwords (map show gens)
+{-# INLINE renderWord #-}
 
 (><) :: WordL -> WordL -> WordL
 W a >< W b = W (a ++ b)

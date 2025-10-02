@@ -1,0 +1,68 @@
+lambda2
+mu1 mu1
+mu2
+lambda2 lambda1
+lambda2 mu1
+lambda3
+mu1 mu1 lambda1
+mu2 lambda1
+mu1 mu1 mu1
+mu2 mu1
+mu3
+lambda2 lambda1 lambda1
+lambda2 lambda1 mu1
+lambda2 mu1 lambda1
+lambda3 lambda1
+mu1 mu1 lambda1 lambda1
+mu2 lambda1 lambda1
+lambda2 mu1 mu1
+lambda3 mu1
+lambda4
+mu1 mu1 lambda1 mu1
+mu1 mu1 lambda2
+mu1 mu1 mu1 lambda1
+mu2 lambda1 mu1
+mu2 mu1 lambda1
+mu3 lambda1
+lambda2 lambda1 lambda1 lambda1
+mu1 mu1 mu1 mu1
+mu2 mu1 mu1
+mu3 mu1
+mu4
+lambda2 lambda1 lambda1 mu1
+lambda2 lambda1 lambda2
+lambda2 lambda1 mu1 lambda1
+lambda2 mu1 lambda1 lambda1
+lambda3 lambda1 lambda1
+mu1 mu1 lambda1 lambda1 lambda1
+mu2 lambda1 lambda1 lambda1
+lambda2 lambda1 mu1 mu1
+lambda2 lambda1 mu2
+lambda2 mu1 lambda1 mu1
+lambda2 mu1 lambda2
+lambda2 mu1 mu1 lambda1
+lambda3 lambda1 mu1
+lambda3 mu1 lambda1
+lambda4 lambda1
+mu1 mu1 lambda1 lambda1 mu1
+mu1 mu1 lambda1 lambda2
+lambda2 lambda1 lambda1 lambda1 lambda1
+lambda2 mu1 mu1 mu1
+lambda3 mu1 mu1
+lambda4 mu1
+lambda5
+mu1 mu1 lambda1 mu1 mu1
+mu1 mu1 lambda1 mu2
+mu1 mu1 lambda2 mu1
+mu1 mu1 lambda3
+mu1 mu1 mu1 lambda1 mu1
+lambda2 lambda1 lambda1 lambda1 mu1
+lambda2 lambda1 lambda1 lambda2
+lambda2 lambda1 lambda1 mu1 lambda1
+lambda2 lambda1 lambda2 lambda1
+lambda2 lambda1 mu1 lambda1 lambda1
+lambda2 mu1 lambda1 lambda1 lambda1
+lambda3 lambda1 lambda1 lambda1
+mu1 mu1 lambda1 lambda1 lambda1 lambda1
+mu1 mu1 mu1 mu1 mu1
+mu2 lambda1 lambda1 lambda1 lambda1

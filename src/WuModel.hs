@@ -12,7 +12,12 @@
 -- |     Fox-нормы (ℓ¹ и p-adic) этих циклов — пригодно для reward shaping.
 -- |   • Самотесты на классических примерах.
 -- |
-module WuModel (runWuTests) where
+module WuModel (runWuTests
+  , Template(..) 
+  , h1Invariants
+  , buildFromTemplate
+  , foxJacobianZ
+  ) where
 
 import           Data.List        (foldl', transpose)
 import           Data.Map.Strict  (Map)

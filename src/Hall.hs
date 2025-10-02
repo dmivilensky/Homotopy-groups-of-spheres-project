@@ -31,6 +31,7 @@ module Hall
   , GroupNF(..), identityG, groupMul, groupPow, groupComm, normalizeNF, lieZtoG
   , smithNormalForm, smithDiag
   , runHallTests
+  , zeroLZ
   ) where
 
 import qualified Data.Map.Strict as M

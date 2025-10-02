@@ -9,6 +9,12 @@
 
 module Bridge
   ( runBridgeTests
+  , ThetaQ(..) 
+  , BCHMode(..) 
+  , QuantStats(..) 
+  , thetaQInitCanon
+  , quantizeViaBCHFast
+  , quantizeViaBCHWithPadic
   ) where
 
 import           Data.List            (foldl')
